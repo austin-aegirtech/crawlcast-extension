@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Miteruno Metrics</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: #1a1a1a; color: #fff; padding: 24px;
+    }
+    h1 { font-size: 20px; margin-bottom: 4px; }
+    .sub { color: #888; font-size: 12px; margin-bottom: 24px; }
+    .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin-bottom: 24px; }
+    .card { background: #2d2d2d; border-radius: 8px; padding: 16px; }
+    .card .label { font-size: 11px; color: #888; text-transform: uppercase; letter-spacing: 0.5px; }
+    .card .value { font-size: 26px; font-weight: 600; margin-top: 6px; color: #4CAF50; }
+    .charts { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 24px; }
+    .panel { background: #2d2d2d; border-radius: 8px; padding: 16px; }
+    .panel h2 { font-size: 13px; color: #aaa; margin-bottom: 12px; }
+    table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #3d3d3d; }
+    th { color: #888; font-weight: 500; }
+    td.event-name { color: #4CAF50; }
+    .error-row td.event-name { color: #f44336; }
+    @media (max-width: 900px) { .charts { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <h1>🎬 Miteruno Metrics</h1>
+  <div class="sub" id="updated">Loading…</div>
+
+  <div class="cards" id="cards"></div>
+
+  <div class="charts">
+    <div class="panel"><h2>Active installs per day</h2><canvas id="dauChart"></canvas></div>
+    <div class="panel"><h2>Events per day</h2><canvas id="eventsChart"></canvas></div>
+    <div class="panel"><h2>Data downloaded per day</h2><canvas id="bytesChart"></canvas></div>
+    <div class="panel"><h2>Versions</h2><canvas id="versionChart"></canvas></div>
+  </div>
+
+  <div class="panel">
+    <h2>Recent events</h2>
+    <table>
+      <thead><tr><th>Time</th><th>Install</th><th>Version</th><th>Event</th><th>Details</th></tr></thead>
+      <tbody id="recentBody"></tbody>
+    </table>
+  </div>
+
+  <script>
+    const EVENT_COLORS = {
+      stream_detected: '#2196F3',
+      download_start: '#FFC107',
+      download_complete: '#4CAF50',
+      download_error: '#f44336',
+      thumbnail_generated: '#9C27B0',
+      extension_installed: '#00BCD4'
+    };
+
+    function fmtBytes(b) {
+      if (b >= 1e9) return (b / 1e9).toFixed(2) + ' GB';
+      if (b >= 1e6) return (b / 1e6).toFixed(1) + ' MB';
+      if (b >= 1e3) return (b / 1e3).toFixed(0) + ' KB';
+      return b + ' B';
+    }
+
+    function card(label, value) {
+      return `<div class="card"><div class="label">${label}</div><div class="value">${value}</div></div>`;
+    }
+
+    async function load() {
+      const stats = await (await fetch('api/stats')).json();
+      const t = stats.totals;
+
+      document.getElementById('updated').textContent =
+        `Updated ${new Date(stats.generatedAt).toLocaleString()} — auto-refreshes every 30s`;
+
+      document.getElementById('cards').innerHTML =
+        card('Installs', t.installs) +
+        card('Downloads', t.downloads) +
+        card('Downloaded', fmtBytes(t.bytesDownloaded)) +
+        card('Error rate', (t.errorRate * 100).toFixed(1) + '%') +
+        card('Avg download time', (t.avgDownloadMs / 1000).toFixed(1) + 's') +
+        card('Total events', t.events);
+
+      const days = stats.daily.map(d => d.day);
+      const chartOpts = {
+        responsive: true,
+        plugins: { legend: { labels: { color: '#aaa', boxWidth: 12 } } },
+        scales: {
+          x: { ticks: { color: '#888' }, grid: { color: '#3d3d3d' } },
+          y: { ticks: { color: '#888' }, grid: { color: '#3d3d3d' }, beginAtZero: true }
+        }
+      };
+
+      charts.forEach(c => c.destroy());
+      charts = [];
+
+      charts.push(new Chart(dauChart, {
+        type: 'line',
+        data: { labels: days, datasets: [{
+          label: 'Active installs', data: stats.daily.map(d => d.activeInstalls),
+          borderColor: '#4CAF50', backgroundColor: 'rgba(76,175,80,0.15)', fill: true, tension: 0.3
+        }]},
+        options: chartOpts
+      }));
+
+      const eventNames = [...new Set(stats.daily.flatMap(d => Object.keys(d.events)))];
+      charts.push(new Chart(eventsChart, {
+        type: 'bar',
+        data: { labels: days, datasets: eventNames.map(name => ({
+          label: name, data: stats.daily.map(d => d.events[name] || 0),
+          backgroundColor: EVENT_COLORS[name] || '#607D8B'
+        }))},
+        options: { ...chartOpts, scales: { x: { ...chartOpts.scales.x, stacked: true }, y: { ...chartOpts.scales.y, stacked: true } } }
+      }));
+
+      charts.push(new Chart(bytesChart, {
+        type: 'bar',
+        data: { labels: days, datasets: [{
+          label: 'Bytes', data: stats.daily.map(d => d.bytes), backgroundColor: '#2196F3'
+        }]},
+        options: {
+          ...chartOpts,
+          plugins: { ...chartOpts.plugins, tooltip: { callbacks: { label: ctx => fmtBytes(ctx.raw) } } }
+        }
+      }));
+
+      charts.push(new Chart(versionChart, {
+        type: 'doughnut',
+        data: {
+          labels: Object.keys(stats.versions),
+          datasets: [{ data: Object.values(stats.versions),
+            backgroundColor: ['#4CAF50', '#2196F3', '#FFC107', '#9C27B0', '#f44336'] }]
+        },
+        options: { plugins: { legend: { labels: { color: '#aaa', boxWidth: 12 } } } }
+      }));
+
+      document.getElementById('recentBody').innerHTML = stats.recent.map(e => `
+        <tr class="${e.event === 'download_error' ? 'error-row' : ''}">
+          <td>${new Date(e.ts).toLocaleString()}</td>
+          <td><code>${e.installId}</code></td>
+          <td>${e.version}</td>
+          <td class="event-name">${e.event}</td>
+          <td>${Object.entries(e.props).map(([k, v]) => `${k}=${k === 'bytes' ? fmtBytes(v) : v}`).join(' ')}</td>
+        </tr>`).join('');
+    }
+
+    let charts = [];
+    load().catch(err => {
+      document.getElementById('updated').textContent = 'Failed to load stats: ' + err.message;
+    });
+    setInterval(() => load().catch(() => {}), 30000);
+  </script>
+</body>
+</html>
