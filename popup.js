@@ -215,6 +215,7 @@ function renderStreams(streams, tabId) {
   
   listEl.innerHTML = streams.map((stream, index) => {
     const isDownloading = activeDownloadsUI.has(stream.url) || stream.downloading;
+    const isDownloaded = !isDownloading && !!stream.downloaded;
     
     if (stream.frames && stream.frames.length > 1) {
       thumbFrames.set(stream.url, stream.frames);
@@ -248,12 +249,12 @@ function renderStreams(streams, tabId) {
         <div class="download-section">
           <div class="btn-row">
             <button
-              class="btn-primary download-btn"
+              class="btn-primary download-btn${isDownloaded ? ' btn-downloaded' : ''}"
               data-url="${escapeHtml(stream.url)}"
               data-tab="${tabId}"
-              ${isDownloading ? 'disabled' : ''}
+              ${(isDownloading || isDownloaded) ? 'disabled' : ''}
             >
-              ${isDownloading ? '⏳ Downloading...' : '⬇️ Download as MP4'}
+              ${isDownloading ? '⏳ Downloading...' : isDownloaded ? '✅ Downloaded' : '⬇️ Download as MP4'}
             </button>
             ${isDownloading ? `<button class="btn-danger cancel-btn" data-url="${escapeHtml(stream.url)}">✕ Cancel</button>` : ''}
           </div>
@@ -390,11 +391,15 @@ function onDownloadComplete(url, result) {
     statusEl.textContent = `✅ Download complete: ${result.filename}`;
   }
   
-  // Re-enable button
+  // Lock the button rather than re-enabling it — the file is already saved,
+  // so offering "Download as MP4" again invites a confusing duplicate.
+  // background.js persists this on the stream record too, so it stays
+  // locked even if the popup is closed and reopened.
   const btn = document.querySelector(`button[data-url="${CSS.escape(url)}"]`);
   if (btn) {
-    btn.disabled = false;
-    btn.textContent = '⬇️ Download as MP4';
+    btn.disabled = true;
+    btn.textContent = '✅ Downloaded';
+    btn.classList.add('btn-downloaded');
   }
 }
 

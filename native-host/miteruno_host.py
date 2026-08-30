@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """
+<<<<<<< Updated upstream
+Crawlcast native messaging host.
+=======
 Miteruno native messaging host.
+>>>>>>> Stashed changes
 
 A thin, general-purpose pipe between the Chrome extension and an external
 downloader program that the USER has installed on their own machine.
@@ -15,7 +19,11 @@ Messages in:   {"url": "...", "outdir": "optional/path"}
                {"action": "remux", "path": "C:/.../video.mp4"}
 Messages out:  {"type": "progress", "percent": 12.3, "line": "..."}
                {"type": "done", "filename": "..."}
+<<<<<<< Updated upstream
                {"type": "remuxed", "path": "...", "bytes": 123}
+=======
+               {"type": "remuxed", "path": "...", "bytes": 123, "normalized": true}
+>>>>>>> Stashed changes
                {"type": "remuxSkipped", "message": "..."}
                {"type": "error", "message": "..."}
 """
@@ -28,6 +36,15 @@ import subprocess
 import sys
 
 # The external program invoked for each request. Must already be installed
+<<<<<<< Updated upstream
+# and on PATH (or given as an absolute path). Override with CRAWLCAST_DL_BIN.
+DOWNLOADER_BIN = os.environ.get("CRAWLCAST_DL_BIN", "yt-dlp")
+
+# Used to repair fragmented MP4s produced by the in-browser pipeline.
+# Optional: if absent, files are simply left as they are.
+FFMPEG_BIN = os.environ.get("CRAWLCAST_FFMPEG_BIN", "ffmpeg")
+FFPROBE_BIN = os.environ.get("CRAWLCAST_FFPROBE_BIN", "ffprobe")
+=======
 # and on PATH (or given as an absolute path). Override with MITERUNO_DL_BIN.
 DOWNLOADER_BIN = os.environ.get("MITERUNO_DL_BIN", "yt-dlp")
 
@@ -35,6 +52,18 @@ DOWNLOADER_BIN = os.environ.get("MITERUNO_DL_BIN", "yt-dlp")
 # Optional: if absent, files are simply left as they are.
 FFMPEG_BIN = os.environ.get("MITERUNO_FFMPEG_BIN", "ffmpeg")
 FFPROBE_BIN = os.environ.get("MITERUNO_FFPROBE_BIN", "ffprobe")
+
+# Loudness normalization target, applied to every remuxed file that has an
+# audio track (two-pass EBU R128-style loudnorm). I=-16 LUFS matches common
+# streaming-platform targets; TP=-1.5 dBTP leaves true-peak headroom; LRA=11
+# caps how much loudness varies within one file. Using the same targets for
+# every download is what makes separately-downloaded files land at a
+# consistent, comparable volume instead of some being much louder/quieter
+# or "flatter" than others.
+LOUDNORM_I = "-16"
+LOUDNORM_TP = "-1.5"
+LOUDNORM_LRA = "11"
+>>>>>>> Stashed changes
 
 PROGRESS_RE = re.compile(r"\[download\]\s+([\d.]+)%")
 DEST_RE = re.compile(r"\[download\] Destination:\s*(.+)")
@@ -98,7 +127,11 @@ def run_download(url, outdir=None):
     except FileNotFoundError:
         send_message({
             "type": "error",
+<<<<<<< Updated upstream
+            "message": f"'{DOWNLOADER_BIN}' not found on PATH. Install it or set CRAWLCAST_DL_BIN.",
+=======
             "message": f"'{DOWNLOADER_BIN}' not found on PATH. Install it or set MITERUNO_DL_BIN.",
+>>>>>>> Stashed changes
         })
         return
     except Exception as exc:  # noqa: BLE001 - surface anything to the UI
@@ -137,15 +170,93 @@ def run_download(url, outdir=None):
         })
 
 
+<<<<<<< Updated upstream
 def run_remux(path, audio_path=None):
     """
     Rebuild a fragmented MP4 into a normal, seekable one, in place.
+=======
+def has_audio_stream(path):
+    """True if ffprobe finds at least one audio stream in path."""
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+    try:
+        out = subprocess.run(
+            [FFPROBE_BIN, "-v", "error", "-select_streams", "a",
+             "-show_entries", "stream=index", "-of", "csv=p=0", path],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            universal_newlines=True, creationflags=creationflags,
+        )
+        return bool(out.stdout.strip())
+    except (FileNotFoundError, OSError):
+        return False
+
+
+def measure_loudness(path):
+    """
+    Pass 1 of two-pass loudnorm: analyze path's audio against the LOUDNORM_*
+    targets and return the measured stats dict, or None on any failure
+    (missing ffmpeg, no audio, unparseable output) so callers can fall back
+    to an unnormalized remux rather than losing the file.
+
+    Deliberately does not pass "-v error" — loudnorm prints its JSON stats
+    at the info log level, which "-v error" would silently swallow along
+    with everything else.
+    """
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+    cmd = [FFMPEG_BIN, "-nostdin", "-hide_banner", "-y",
+           "-i", path,
+           "-af", f"loudnorm=I={LOUDNORM_I}:TP={LOUDNORM_TP}:LRA={LOUDNORM_LRA}:print_format=json",
+           "-f", "null", "-"]
+    try:
+        proc = subprocess.run(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            universal_newlines=True, creationflags=creationflags,
+        )
+    except (FileNotFoundError, OSError):
+        return None
+
+    match = re.search(r'\{[^{}]*"input_i"[^{}]*\}', proc.stdout or "", re.DOTALL)
+    if not match:
+        return None
+    try:
+        return json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return None
+
+
+def build_loudnorm_filter(stats):
+    """Second-pass loudnorm filter string, fed pass 1's measured values."""
+    return (
+        f"loudnorm=I={LOUDNORM_I}:TP={LOUDNORM_TP}:LRA={LOUDNORM_LRA}"
+        f":measured_I={stats['input_i']}:measured_TP={stats['input_tp']}"
+        f":measured_LRA={stats['input_lra']}:measured_thresh={stats['input_thresh']}"
+        f":offset={stats['target_offset']}:linear=true:print_format=summary"
+    )
+
+
+def run_remux(path, audio_path=None):
+    """
+    Rebuild a fragmented MP4 into a normal, seekable one, in place, and
+    loudness-normalize its audio.
+>>>>>>> Stashed changes
 
     The in-browser pipeline emits fragmented MP4: empty sample tables, no
     sidx/mfra index. Players must scan every fragment before playback, which
     causes slow startup, broken seeking, and transcoder failures. Running
     `-c copy` rebuilds real sample tables without re-encoding; +faststart puts
+<<<<<<< Updated upstream
     moov at the front. Fast and lossless.
+=======
+    moov at the front. The video stream stays a lossless copy either way.
+
+    When the file has an audio track, its audio is additionally re-encoded
+    through a two-pass loudnorm pass (see LOUDNORM_* above) so every
+    download ends up at the same target loudness and dynamic range, rather
+    than each stream keeping whatever level the source happened to have.
+    That step only touches audio — if it fails for any reason (no audio
+    track, ffmpeg/ffprobe missing, unparseable measurement), this silently
+    falls back to the previous plain, lossless `-c copy` behavior so the
+    file is never lost over it.
+>>>>>>> Stashed changes
 
     When audio_path is given, the stream had a separate audio rendition and
     the two files are merged in the same pass — the video file on its own is
@@ -165,6 +276,19 @@ def run_remux(path, audio_path=None):
             "message": f"Audio file not found: {audio_path} — video left silent.",
         })
 
+<<<<<<< Updated upstream
+=======
+    # Whichever file will supply the final audio track is what gets measured.
+    audio_source = audio_path if merging else path
+    normalized = False
+    loudnorm_filter = None
+    if has_audio_stream(audio_source):
+        stats = measure_loudness(audio_source)
+        if stats:
+            loudnorm_filter = build_loudnorm_filter(stats)
+            normalized = True
+
+>>>>>>> Stashed changes
     stem, ext = os.path.splitext(path)
     if ext.lower() not in (".mp4", ".m4v", ".mov"):
         ext = ".mp4"
@@ -176,6 +300,7 @@ def run_remux(path, audio_path=None):
     if merging:
         # -map picks video from input 0 and audio from input 1; -shortest
         # guards against a track that runs slightly long.
+<<<<<<< Updated upstream
         cmd = [FFMPEG_BIN, "-nostdin", "-v", "error", "-y",
                "-i", path, "-i", audio_path,
                "-map", "0:v:0", "-map", "1:a:0",
@@ -183,6 +308,25 @@ def run_remux(path, audio_path=None):
     else:
         cmd = [FFMPEG_BIN, "-nostdin", "-v", "error", "-y",
                "-i", path, "-c", "copy", "-movflags", "+faststart", tmp]
+=======
+        base = [FFMPEG_BIN, "-nostdin", "-v", "error", "-y",
+                "-i", path, "-i", audio_path,
+                "-map", "0:v:0", "-map", "1:a:0"]
+        if loudnorm_filter:
+            cmd = base + ["-c:v", "copy", "-af", loudnorm_filter, "-ar", "48000",
+                          "-c:a", "aac", "-b:a", "192k",
+                          "-movflags", "+faststart", "-shortest", tmp]
+        else:
+            cmd = base + ["-c", "copy", "-movflags", "+faststart", "-shortest", tmp]
+    else:
+        base = [FFMPEG_BIN, "-nostdin", "-v", "error", "-y", "-i", path]
+        if loudnorm_filter:
+            cmd = base + ["-c:v", "copy", "-af", loudnorm_filter, "-ar", "48000",
+                          "-c:a", "aac", "-b:a", "192k",
+                          "-movflags", "+faststart", tmp]
+        else:
+            cmd = base + ["-c", "copy", "-movflags", "+faststart", tmp]
+>>>>>>> Stashed changes
 
     try:
         proc = subprocess.run(
@@ -206,10 +350,26 @@ def run_remux(path, audio_path=None):
 
     # Verify by DURATION, not size: a lossless remux can legitimately shrink
     # a file substantially, so a size heuristic yields false failures.
+<<<<<<< Updated upstream
     if ok:
         d_src, d_out = probe_duration(path), probe_duration(tmp)
         if d_src and d_out and not (d_src * 0.99 < d_out < d_src * 1.01):
             ok = False
+=======
+    #
+    # Tolerance is 1% OR 0.5s, whichever is larger — a pure percentage check
+    # is too tight for short clips once loudnorm is in play: re-encoding
+    # audio through AAC adds a small, roughly fixed amount of encoder
+    # priming/padding (observed ~100ms in testing) that shows up as extra
+    # container duration regardless of how long the source is. A genuine
+    # failure (e.g. a truncated remux) differs by far more than this floor.
+    if ok:
+        d_src, d_out = probe_duration(path), probe_duration(tmp)
+        if d_src and d_out:
+            tolerance = max(d_src * 0.01, 0.5)
+            if not (d_src - tolerance < d_out < d_src + tolerance):
+                ok = False
+>>>>>>> Stashed changes
 
     if ok:
         try:
@@ -225,7 +385,12 @@ def run_remux(path, audio_path=None):
                     pass
             send_message({"type": "remuxed", "path": target,
                           "bytes": os.path.getsize(target),
+<<<<<<< Updated upstream
                           "merged": merging})
+=======
+                          "merged": merging,
+                          "normalized": normalized})
+>>>>>>> Stashed changes
         except OSError as exc:
             send_message({"type": "error", "message": f"Could not replace file: {exc}"})
     else:

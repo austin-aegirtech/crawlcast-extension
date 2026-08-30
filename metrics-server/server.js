@@ -1,5 +1,5 @@
 /**
- * Miteruno metrics collector + dashboard server.
+ * Crawlcast metrics collector + dashboard server.
  * Zero dependencies — Node.js built-ins only. Events are appended to
  * events.jsonl (one JSON object per line); stats are aggregated on read
  * with an mtime-based cache.

@@ -386,6 +386,15 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         streamUrl: request.streamUrl
       });
 
+      // Persist completion on the stream record itself so the button still
+      // shows "already downloaded" after the popup is closed and reopened,
+      // not just for the rest of this popup session.
+      const streamRec = detectedStreams.get(request.streamUrl);
+      if (streamRec) {
+        streamRec.downloaded = true;
+        persistStreams();
+      }
+
       const stats = request.stats || {};
       trackEvent('download_complete', {
         bytes: stats.bytesDownloaded || 0,
@@ -520,7 +529,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 // it only opens the pipe and relays progress.
 // ---------------------------------------------------------------------------
 
-const NATIVE_HOST = 'com.miteruno.downloader';
+const NATIVE_HOST = 'com.crawlcast.downloader';
 
 function startExternalDownload(url) {
   let port;

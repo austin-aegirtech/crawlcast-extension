@@ -1,6 +1,6 @@
-# Miteruno Metrics Server
+# Crawlcast Metrics Server
 
-Zero-dependency telemetry collector and dashboard for the Miteruno extension.
+Zero-dependency telemetry collector and dashboard for the Crawlcast extension.
 Events arrive at `POST /collect`, are appended to `events.jsonl`, and the
 dashboard at `/` aggregates them live (auto-refresh every 30s).
 
@@ -13,12 +13,12 @@ node server.js
 
 ## Deploy on ployan.me
 
-1. Copy this folder to the server, e.g. `/opt/miteruno-metrics/`.
+1. Copy this folder to the server, e.g. `/opt/crawlcast-metrics/`.
 
 2. nginx — add inside the existing `server { }` block for ployan.me:
 
    ```nginx
-   location /miteruno-metrics/ {
+   location /crawlcast-metrics/ {
        proxy_pass http://127.0.0.1:8787/;
        proxy_set_header Host $host;
    }
@@ -26,15 +26,15 @@ node server.js
 
    Then `sudo nginx -t && sudo systemctl reload nginx`.
 
-3. Keep it running with systemd — `/etc/systemd/system/miteruno-metrics.service`:
+3. Keep it running with systemd — `/etc/systemd/system/crawlcast-metrics.service`:
 
    ```ini
    [Unit]
-   Description=Miteruno metrics collector
+   Description=Crawlcast metrics collector
    After=network.target
 
    [Service]
-   ExecStart=/usr/bin/node /opt/miteruno-metrics/server.js
+   ExecStart=/usr/bin/node /opt/crawlcast-metrics/server.js
    Restart=always
    User=www-data
 
@@ -44,18 +44,18 @@ node server.js
 
    ```bash
    sudo systemctl daemon-reload
-   sudo systemctl enable --now miteruno-metrics
+   sudo systemctl enable --now crawlcast-metrics
    ```
 
 4. Verify:
 
    ```bash
-   curl -X POST https://ployan.me/miteruno-metrics/collect \
+   curl -X POST https://ployan.me/crawlcast-metrics/collect \
      -H 'Content-Type: application/json' \
      -d '{"installId":"test","version":"1.1.0","events":[{"event":"download_complete","props":{"bytes":1000000,"ms":4000},"ts":0}]}'
    ```
 
-   Then open https://ployan.me/miteruno-metrics/ — the test event should appear.
+   Then open https://ployan.me/crawlcast-metrics/ — the test event should appear.
 
 ## Extension side
 

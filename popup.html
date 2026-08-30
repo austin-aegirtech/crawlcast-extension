@@ -71,6 +71,16 @@
       color: white;
       flex: 1;
     }
+
+    /* Overrides the generic disabled fade above — this isn't "unavailable",
+       it's "done", so it should read as complete rather than greyed-out. */
+    .btn-primary.btn-downloaded:disabled {
+      background: #2e2e2e;
+      color: #8bc98f;
+      border: 1px solid #3d5a3f;
+      opacity: 1;
+      cursor: default;
+    }
     
     .btn-secondary {
       background: #3d3d3d;

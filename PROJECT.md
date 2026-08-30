@@ -1,4 +1,4 @@
-# Miteruno — Technical Documentation
+# Crawlcast — Technical Documentation
 
 > **Running document.** Update the [Change Log](#14-change-log) whenever behaviour
 > changes, and keep [Known Limitations](#12-known-limitations--trade-offs) honest.
@@ -28,7 +28,7 @@
 
 ## 1. What This Is
 
-Miteruno is a Chrome extension (Manifest V3) that detects **HLS video streams**
+Crawlcast is a Chrome extension (Manifest V3) that detects **HLS video streams**
 on any web page and converts them into playable MP4 files entirely inside the
 browser — no server, no upload, no external service.
 
@@ -76,7 +76,7 @@ call each other directly; everything happens by message passing.
                             │ downloadStream            │ connectNative   │
                             ▼                           ▼                 │
                  ┌─────────────────────┐    ┌───────────────────────┐     │
-                 │    offscreen.js     │    │  miteruno_host.py     │     │
+                 │    offscreen.js     │    │  crawlcast_host.py     │     │
                  │  (offscreen.html)   │    │  (native host)        │     │
                  │                     │    │                       │     │
                  │  • VideoDownloader  │    │  • spawns yt-dlp      │     │
@@ -110,7 +110,7 @@ exists purely to provide DOM APIs the service worker lacks: `Blob`,
 `URL.createObjectURL`, `<video>`, `<canvas>`. All heavy lifting happens here.
 Created on demand, destroyed when idle.
 
-**Native host** (`miteruno_host.py`) — a local process outside the browser
+**Native host** (`crawlcast_host.py`) — a local process outside the browser
 entirely, reached over stdio. Handles cases the in-browser pipeline can't.
 
 ---
@@ -161,9 +161,9 @@ Line counts as of v1.0.0 (Himitsu).
 
 | File | Lines | Role |
 |---|---:|---|
-| `native-host/miteruno_host.py` | 285 | Native host: external downloads **and** post-download remux |
-| `native-host/miteruno_host.bat` | 5 | Windows launcher (Chrome can't exec `.py`) |
-| `native-host/com.miteruno.downloader.json` | 9 | Native host manifest |
+| `native-host/crawlcast_host.py` | 285 | Native host: external downloads **and** post-download remux |
+| `native-host/crawlcast_host.bat` | 5 | Windows launcher (Chrome can't exec `.py`) |
+| `native-host/com.crawlcast.downloader.json` | 9 | Native host manifest |
 | `tools/remux.sh` | 252 | Batch-repair existing files (bash) |
 | `tools/Repair-Videos.ps1` | 320 | Batch-repair + damage scan (PowerShell) |
 | `metrics-server/server.js` | 196 | Zero-dependency collector + API |
@@ -529,8 +529,8 @@ extension ◄── {"type": "error", "message": "..."}
 ```
 
 Binaries are configurable by environment variable, so nothing is hardcoded:
-`MITERUNO_DL_BIN` (default `yt-dlp`), `MITERUNO_FFMPEG_BIN` (`ffmpeg`),
-`MITERUNO_FFPROBE_BIN` (`ffprobe`).
+`CRAWLCAST_DL_BIN` (default `yt-dlp`), `CRAWLCAST_FFMPEG_BIN` (`ffmpeg`),
+`CRAWLCAST_FFPROBE_BIN` (`ffprobe`).
 
 ### 9.2 External downloads
 
@@ -745,7 +745,7 @@ read back `mvhd`/`tkhd`/`mdhd` and confirm each equals `duration × its timescal
 **Progress display** — assert 4127/4130 renders 99%, and only 4130/4130 renders 100%.
 
 **Native host — downloads** — pipe a length-prefixed message to
-`miteruno_host.py` with `MITERUNO_DL_BIN` pointed at a mock script; assert
+`crawlcast_host.py` with `CRAWLCAST_DL_BIN` pointed at a mock script; assert
 progress/done framing, plus the three failure modes (missing binary, bad URL,
 non-zero exit).
 
@@ -754,7 +754,7 @@ non-zero exit).
 `{action:'remux'}`, then assert the output has **zero `moof` boxes**, `moov`
 before `mdat`, an unchanged duration, the same filename, and no leftover
 `.remux.tmp` file. Failure paths: missing file, missing path, absent ffmpeg
-(via `MITERUNO_FFMPEG_BIN`), and a corrupt input — each must leave the original
+(via `CRAWLCAST_FFMPEG_BIN`), and a corrupt input — each must leave the original
 untouched.
 
 **`tools/remux.sh`** — a directory containing filenames with spaces and
