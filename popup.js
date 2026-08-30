@@ -5,75 +5,12 @@ const activeDownloadsUI = new Map();
 const thumbFrames = new Map();
 
 // Initialize
-document.addEventListener('DOMContentLoaded', async () => {
-  document.getElementById('loginForm').addEventListener('submit', handleLoginSubmit);
-  document.getElementById('logoutBtn').addEventListener('click', handleLogout);
-
-  const session = await getAuthSession();
-  if (session) {
-    showApp(session);
-  } else {
-    showLogin();
-  }
-});
-
-/** Show the login form, hide the rest of the extension. */
-function showLogin(errorMessage) {
-  document.getElementById('loginScreen').style.display = 'flex';
-  document.getElementById('appRoot').style.display = 'none';
-
-  const errorEl = document.getElementById('loginError');
-  if (errorMessage) {
-    errorEl.textContent = errorMessage;
-    errorEl.style.display = 'block';
-  } else {
-    errorEl.style.display = 'none';
-  }
-}
-
-/** Reveal the real extension UI and wire up its event handlers. */
-function showApp(session) {
-  document.getElementById('loginScreen').style.display = 'none';
-  document.getElementById('appRoot').style.display = 'block';
-  document.getElementById('userBadgeName').textContent = session.username;
-
+document.addEventListener('DOMContentLoaded', () => {
   initAppHandlers();
   loadStreams();
-}
+});
 
-async function handleLoginSubmit(e) {
-  e.preventDefault();
-
-  const username = document.getElementById('loginUsername').value.trim();
-  const password = document.getElementById('loginPassword').value;
-  const btn = document.getElementById('loginSubmitBtn');
-
-  btn.disabled = true;
-  btn.textContent = 'Signing in…';
-
-  try {
-    const session = await authLogin(username, password);
-    // Let the service worker know right away — it won't otherwise learn of
-    // this until it re-reads storage after its next restart.
-    chrome.runtime.sendMessage({ action: 'authChanged', session }).catch(() => {});
-    document.getElementById('loginPassword').value = '';
-    showApp(session);
-  } catch (err) {
-    showLogin(err.message);
-  } finally {
-    btn.disabled = false;
-    btn.textContent = 'Sign in';
-  }
-}
-
-async function handleLogout() {
-  await authLogout();
-  chrome.runtime.sendMessage({ action: 'authChanged', session: null }).catch(() => {});
-  showLogin();
-}
-
-// Wired once, the first time the app UI is shown — DOMContentLoaded no
-// longer does this directly since the login screen may show first.
+// Wired once on load.
 let appHandlersInitialized = false;
 function initAppHandlers() {
   if (appHandlersInitialized) return;
@@ -165,14 +102,6 @@ async function loadStreams() {
     action: 'getStreams',
     tabId: tab.id
   });
-
-  if (response && response.authRequired) {
-    // Background disagrees with our local session (e.g. it never learned of
-    // one, or was cleared out from under us) — fall back to the login screen
-    // rather than rendering an empty, confusing stream list.
-    showLogin();
-    return;
-  }
 
   renderStreams(response.streams || [], tab.id);
 
