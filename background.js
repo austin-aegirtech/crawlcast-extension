@@ -1,27 +1,5 @@
 // Download pipeline runs in offscreen.html (service workers have no DOM);
 // this worker only detects streams and brokers messages.
-importScripts('telemetry.js', 'auth.js');
-
-// ---------------------------------------------------------------------------
-// Auth gate (private test period)
-//
-// Himitsu is gated behind login while it's limited to a small test group.
-// Session state mirrors the streams pattern below it: an in-memory copy plus
-// a restore promise, backed by chrome.storage.session so it survives worker
-// suspension but clears when the browser fully closes — testers sign in
-// again each browser session, per the agreed design.
-//
-// The popup performs the actual login (see auth.js / popup.js) and then
-// sends 'authChanged' so this worker's in-memory copy updates immediately,
-// rather than waiting for the next restart to re-read storage.
-// ---------------------------------------------------------------------------
-let authSession = null;
-const authRestored = getAuthSession().then((session) => { authSession = session; });
-
-function isAuthenticated() {
-  return !!authSession;
-}
-
 // Store detected streams
 const detectedStreams = new Map();
 const activeDownloads = new Map();
@@ -98,14 +76,12 @@ async function remuxDownloadedFile(downloadId, streamUrl) {
 
   port.onMessage.addListener((msg) => {
     if (msg.type === 'remuxed') {
-      trackEvent('remux_complete', { bytes: msg.bytes || 0, merged: !!msg.merged });
       broadcast({
         action: 'remuxComplete', url: streamUrl, path: msg.path, merged: !!msg.merged
       });
       port.disconnect();
     } else if (msg.type === 'remuxSkipped' || msg.type === 'error') {
       console.log('[Remux] Skipped:', msg.message);
-      trackEvent('remux_skipped', {});
       broadcast({ action: 'remuxSkipped', url: streamUrl, message: msg.message });
       port.disconnect();
     }
@@ -208,7 +184,6 @@ const M3U8_PATTERN = /\.m3u8($|\?)/i;
 // Listen for network requests
 chrome.webRequest.onBeforeRequest.addListener(
   (details) => {
-    // if (!authSession) return; // gated until the test-group login succeeds
 
     const url = details.url;
     
@@ -234,7 +209,6 @@ chrome.webRequest.onBeforeRequest.addListener(
 
     persistStreams();
     updateBadge(details.tabId);
-    trackEvent('stream_detected', { host: new URL(url).hostname });
     console.log('[M3U8 Detector] Found:', url);
   },
   { urls: ["<all_urls>"] },
@@ -255,12 +229,6 @@ async function updateBadge(tabId) {
 // Message handlers
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
-  // Popup just logged in or out — update our in-memory copy immediately,
-  // rather than waiting for the next worker restart to re-read storage.
-  if (request.action === 'authChanged') {
-    authSession = request.session || null;
-    return false;
-  }
 
   // Log entry forwarded from the offscreen document
   if (request.action === 'log') {
@@ -283,7 +251,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
   // Get streams for popup
   if (request.action === 'getStreams') {
-    if (!isAuthenticated()) { sendResponse({ streams: [], authRequired: true }); return; }
     streamsRestored.then(() => {
       const streams = Array.from(detectedStreams.values())
         .filter(s => s.tabId === request.tabId)
@@ -297,7 +264,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
   // Clear streams
   if (request.action === 'clearStreams') {
-    if (!isAuthenticated()) { sendResponse({ success: false, authRequired: true }); return; }
     console.log('clear streams');
     streamsRestored.then(() => {
       for (const [url, stream] of detectedStreams) {
@@ -332,14 +298,12 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
   // Start download
   if (request.action === 'startDownload') {
-    if (!isAuthenticated()) { sendResponse({ success: false, authRequired: true }); return true; }
     startDownload(request.url, request.filename, sender.tab?.id || request.tabId);
     sendResponse({ success: true, downloadId: request.url });
   }
 
   // Start download via the external downloader bridge
   if (request.action === 'startExternalDownload') {
-    if (!isAuthenticated()) { sendResponse({ success: false, authRequired: true }); return true; }
     startExternalDownload(request.url);
     sendResponse({ success: true });
   }
@@ -396,12 +360,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       }
 
       const stats = request.stats || {};
-      trackEvent('download_complete', {
-        bytes: stats.bytesDownloaded || 0,
-        segments: stats.downloaded || 0,
-        failedSegments: stats.failed || 0,
-        ms: info ? Date.now() - info.startTime : 0
-      });
 
       chrome.runtime.sendMessage({
         action: 'downloadComplete',
@@ -443,13 +401,11 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   // (the popup receives the same broadcast directly)
   if (request.action === 'downloadError') {
     activeDownloads.delete(request.url);
-    trackEvent('download_error', { message: String(request.error).slice(0, 200) });
     maybeCloseOffscreen();
   }
 
   // Popup asks for thumbnails of streams that don't have one yet
   if (request.action === 'generateThumbnails') {
-    if (!isAuthenticated()) { sendResponse({ started: 0, authRequired: true }); return; }
     streamsRestored.then(async () => {
       const targets = (request.urls || []).filter((url) => {
         const s = detectedStreams.get(url);
@@ -495,7 +451,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         if (request.frames) stream.frames = request.frames; // hover animation frames
         persistStreams();
       }
-      trackEvent('thumbnail_generated', { ok: !!request.thumbnail });
       maybeCloseOffscreen();
     });
   }
@@ -505,7 +460,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   // so forward the request there; also release our own tracking immediately
   // so a wedged offscreen doc can never lock the UI permanently.
   if (request.action === 'cancelDownload') {
-    if (!isAuthenticated()) { sendResponse({ success: false, authRequired: true }); return true; }
     activeDownloads.delete(request.url);
     chrome.runtime.sendMessage({
       target: 'offscreen',
@@ -547,12 +501,10 @@ function startExternalDownload(url) {
       broadcast({ action: 'externalProgress', url, percent: msg.percent, line: msg.line });
     } else if (msg.type === 'done') {
       activeDownloads.delete(url);
-      trackEvent('external_download_complete', {});
       broadcast({ action: 'externalComplete', url, filename: msg.filename });
       port.disconnect();
     } else if (msg.type === 'error') {
       activeDownloads.delete(url);
-      trackEvent('external_download_error', { message: String(msg.message).slice(0, 200) });
       broadcast({ action: 'externalError', url, error: msg.message });
       port.disconnect();
     }
@@ -569,8 +521,6 @@ function startExternalDownload(url) {
       });
     }
   });
-
-  trackEvent('external_download_start', {});
   port.postMessage({ url });
 }
 
@@ -598,7 +548,6 @@ async function startDownload(url, filename, tabId) {
   });
 
   await ensureOffscreenDocument();
-  trackEvent('download_start');
 
   chrome.runtime.sendMessage({
     target: 'offscreen',

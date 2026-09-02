@@ -385,112 +385,15 @@
       color: #FFC107;
     }
 
-    /* Login gate (private test period) */
-    .login-screen {
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      justify-content: center;
-      padding: 48px 24px;
-      min-height: 300px;
-    }
-
-    .login-card {
-      width: 100%;
-      max-width: 320px;
-      text-align: center;
-    }
-
-    .login-header {
-      font-size: 18px;
-      font-weight: 600;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      gap: 8px;
-      margin-bottom: 4px;
-    }
-
-    .login-sub {
-      font-size: 12px;
-      color: #888;
-      margin-bottom: 24px;
-    }
-
-    .login-form {
-      display: flex;
-      flex-direction: column;
-      gap: 10px;
-    }
-
-    .login-form input {
-      padding: 10px 12px;
-      border: 1px solid #3d3d3d;
-      border-radius: 6px;
-      background: #212121;
-      color: #fff;
-      font-size: 13px;
-    }
-
-    .login-form input:focus {
-      outline: none;
-      border-color: #4CAF50;
-    }
-
-    .login-form button {
-      margin-top: 4px;
-    }
-
-    .login-error {
-      margin-top: 12px;
-      font-size: 12px;
-      color: #f44336;
-      background: rgba(244, 67, 54, 0.15);
-      border-radius: 4px;
-      padding: 8px;
-    }
-
-    .user-badge {
-      font-size: 11px;
-      color: #888;
-      display: flex;
-      align-items: center;
-      gap: 6px;
-    }
-
-    .user-badge button {
-      padding: 2px 8px;
-      font-size: 11px;
-      background: #3d3d3d;
-      color: #ccc;
-    }
   </style>
 </head>
 <body>
-  <div class="login-screen" id="loginScreen">
-    <div class="login-card">
-      <div class="login-header"><span>🎬</span> Himitsu</div>
-      <div class="login-sub">Private beta — sign in to continue</div>
-      <form class="login-form" id="loginForm">
-        <input type="text" id="loginUsername" placeholder="Username" autocomplete="username">
-        <input type="password" id="loginPassword" placeholder="Password" autocomplete="current-password">
-        <button type="submit" class="btn-primary" id="loginSubmitBtn">Sign in</button>
-      </form>
-      <div class="login-error" id="loginError" style="display: none;"></div>
-    </div>
-  </div>
-
-  <div id="appRoot" style="display: none;">
   <div class="header">
     <h1>
       <span>🎬</span>
       Himitsu
       <span class="count" id="streamCount">0</span>
     </h1>
-    <div class="user-badge" id="userBadge" style="margin-top: 6px;">
-      <span id="userBadgeName"></span>
-      <button id="logoutBtn">Sign out</button>
-    </div>
   </div>
   
   <div class="actions">
@@ -529,9 +432,6 @@
   <div id="streamList" class="stream-list">
     <!-- Streams populated here -->
   </div>
-  </div>
-
-  <script src="auth.js"></script>
   <script src="popup.js"></script>
 </body>
 </html>

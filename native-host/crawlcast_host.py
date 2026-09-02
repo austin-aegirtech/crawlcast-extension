@@ -3,7 +3,7 @@
 <<<<<<< Updated upstream
 Crawlcast native messaging host.
 =======
-Miteruno native messaging host.
+Crawlcast native messaging host.
 >>>>>>> Stashed changes
 
 A thin, general-purpose pipe between the Chrome extension and an external
@@ -45,13 +45,13 @@ DOWNLOADER_BIN = os.environ.get("CRAWLCAST_DL_BIN", "yt-dlp")
 FFMPEG_BIN = os.environ.get("CRAWLCAST_FFMPEG_BIN", "ffmpeg")
 FFPROBE_BIN = os.environ.get("CRAWLCAST_FFPROBE_BIN", "ffprobe")
 =======
-# and on PATH (or given as an absolute path). Override with MITERUNO_DL_BIN.
-DOWNLOADER_BIN = os.environ.get("MITERUNO_DL_BIN", "yt-dlp")
+# and on PATH (or given as an absolute path). Override with CRAWLCAST_DL_BIN.
+DOWNLOADER_BIN = os.environ.get("CRAWLCAST_DL_BIN", "yt-dlp")
 
 # Used to repair fragmented MP4s produced by the in-browser pipeline.
 # Optional: if absent, files are simply left as they are.
-FFMPEG_BIN = os.environ.get("MITERUNO_FFMPEG_BIN", "ffmpeg")
-FFPROBE_BIN = os.environ.get("MITERUNO_FFPROBE_BIN", "ffprobe")
+FFMPEG_BIN = os.environ.get("CRAWLCAST_FFMPEG_BIN", "ffmpeg")
+FFPROBE_BIN = os.environ.get("CRAWLCAST_FFPROBE_BIN", "ffprobe")
 
 # Loudness normalization target, applied to every remuxed file that has an
 # audio track (two-pass EBU R128-style loudnorm). I=-16 LUFS matches common
@@ -130,7 +130,7 @@ def run_download(url, outdir=None):
 <<<<<<< Updated upstream
             "message": f"'{DOWNLOADER_BIN}' not found on PATH. Install it or set CRAWLCAST_DL_BIN.",
 =======
-            "message": f"'{DOWNLOADER_BIN}' not found on PATH. Install it or set MITERUNO_DL_BIN.",
+            "message": f"'{DOWNLOADER_BIN}' not found on PATH. Install it or set CRAWLCAST_DL_BIN.",
 >>>>>>> Stashed changes
         })
         return
