@@ -5,17 +5,90 @@ const activeDownloadsUI = new Map();
 const thumbFrames = new Map();
 
 // Initialize
-document.addEventListener('DOMContentLoaded', () => {
-  initAppHandlers();
-  loadStreams();
+document.addEventListener('DOMContentLoaded', async () => {
+  document.getElementById('loginForm').addEventListener('submit', handleLoginSubmit);
+  document.getElementById('logoutBtn').addEventListener('click', handleLogout);
+
+  const session = await getAuthSession();
+  if (session) {
+    showApp(session);
+  } else {
+    showLogin();
+  }
 });
 
+/** Show the login form, hide the rest of the extension. */
+function showLogin(errorMessage) {
+  document.getElementById('loginScreen').style.display = 'flex';
+  document.getElementById('appRoot').style.display = 'none';
+
+  const errorEl = document.getElementById('loginError');
+  if (errorMessage) {
+    errorEl.textContent = errorMessage;
+    errorEl.style.display = 'block';
+  } else {
+    errorEl.style.display = 'none';
+  }
+}
+
+/** Reveal the real extension UI and wire up its event handlers. */
+function showApp(session) {
+  document.getElementById('loginScreen').style.display = 'none';
+  document.getElementById('appRoot').style.display = 'block';
+  document.getElementById('userBadgeName').textContent = session.username;
+
+  initAppHandlers();
+  loadStreams();
+  refreshLicenseBadge(true); // force a fresh check — may have just returned from checkout
+}
+
+/** Toggle the Upgrade button vs the "Premium" badge based on license status. */
+async function refreshLicenseBadge(forceRefresh = false) {
+  const status = await chrome.runtime.sendMessage({ action: 'getLicenseStatus', forceRefresh });
+  document.getElementById('upgradeBtn').style.display = status.licensed ? 'none' : 'block';
+  document.getElementById('premiumBadge').style.display = status.licensed ? 'block' : 'none';
+}
+
+async function handleLoginSubmit(e) {
+  e.preventDefault();
+
+  const username = document.getElementById('loginUsername').value.trim();
+  const password = document.getElementById('loginPassword').value;
+  const btn = document.getElementById('loginSubmitBtn');
+
+  btn.disabled = true;
+  btn.textContent = 'Signing in…';
+
+  try {
+    const session = await authLogin(username, password);
+    // Let the service worker know right away — it won't otherwise learn of
+    // this until it re-reads storage after its next restart.
+    chrome.runtime.sendMessage({ action: 'authChanged', session }).catch(() => {});
+    document.getElementById('loginPassword').value = '';
+    showApp(session);
+  } catch (err) {
+    showLogin(err.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Sign in';
+  }
+}
+
+async function handleLogout() {
+  await authLogout();
+  chrome.runtime.sendMessage({ action: 'authChanged', session: null }).catch(() => {});
+  showLogin();
+}
+
+// Wired once, the first time the app UI is shown — DOMContentLoaded no
+// longer does this directly since the login screen may show first.
 let appHandlersInitialized = false;
 function initAppHandlers() {
   if (appHandlersInitialized) return;
   appHandlersInitialized = true;
 
   document.getElementById('refreshBtn').addEventListener('click', loadStreams);
+  document.getElementById('reloadRescanBtn').addEventListener('click', reloadAndRescan);
   document.getElementById('clearBtn').addEventListener('click', clearStreams);
 
   document.getElementById('logsBtn').addEventListener('click', toggleLogs);
@@ -30,6 +103,25 @@ function initAppHandlers() {
   document.getElementById('externalUrl').addEventListener('keydown', (e) => {
     if (e.key === 'Enter') startExternalDownload();
   });
+
+  document.getElementById('upgradeBtn').addEventListener('click', async () => {
+    const btn = document.getElementById('upgradeBtn');
+    btn.disabled = true;
+    btn.textContent = '⏳ Opening checkout…';
+    try {
+      await chrome.runtime.sendMessage({ action: 'startCheckout' });
+    } catch (e) {
+      console.error('[Upgrade] Checkout failed to start:', e);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = '✨ Upgrade to Premium — unlimited downloads';
+    }
+  });
+
+  // Re-check license status whenever the popup regains focus — catches a
+  // purchase completed in a checkout tab the user just closed, without
+  // waiting for the hourly cache to expire.
+  window.addEventListener('focus', () => refreshLicenseBadge(true));
   
   // Listen for background messages
   chrome.runtime.onMessage.addListener((message) => {
@@ -95,12 +187,50 @@ function initAppHandlers() {
   });
 }
 
+/**
+ * "Refresh" (loadStreams) only re-reads what's already been detected — it
+ * can't surface a stream that never fired a network request in the first
+ * place. This does the disruptive-but-thorough version: reload the tab so
+ * everything fires fresh, then check again once it's had time to load.
+ * Opt-in and separate from Refresh since reloading resets playback.
+ */
+async function reloadAndRescan() {
+  const btn = document.getElementById('reloadRescanBtn');
+  btn.disabled = true;
+  btn.textContent = '⏳ Reloading…';
+
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+
+    // Drop this tab's stale entries first so anything left over from
+    // before the reload doesn't linger alongside freshly-detected streams
+    await chrome.runtime.sendMessage({ action: 'clearStreams', tabId: tab.id });
+    await chrome.tabs.reload(tab.id);
+
+    // Reloading is async and streams won't appear instantly — give the
+    // page a moment to load and start firing requests before checking.
+    await new Promise((resolve) => setTimeout(resolve, 2500));
+    await loadStreams();
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '↻ Reload & Rescan';
+  }
+}
+
 async function loadStreams() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   const response = await chrome.runtime.sendMessage({
     action: 'getStreams',
     tabId: tab.id
   });
+
+  if (response && response.authRequired) {
+    // Background disagrees with our local session (e.g. it never learned of
+    // one, or was cleared out from under us) — fall back to the login screen
+    // rather than rendering an empty, confusing stream list.
+    showLogin();
+    return;
+  }
 
   renderStreams(response.streams || [], tab.id);
 
@@ -132,18 +262,19 @@ function renderStreams(streams, tabId) {
           <circle cx="12" cy="12" r="4"/>
           <path d="M12 8v8M8 12h8"/>
         </svg>
-        <div>No M3U8 streams detected</div>
+        <div>No downloadable streams detected</div>
         <div style="margin-top: 8px; font-size: 12px; opacity: 0.7;">
           Play a video on this page to detect streams
         </div>
       </div>
+      <div id="mediaScanResult"></div>
     `;
+    scanForOtherMedia(tabId);
     return;
   }
   
   listEl.innerHTML = streams.map((stream, index) => {
     const isDownloading = activeDownloadsUI.has(stream.url) || stream.downloading;
-    const isDownloaded = !isDownloading && !!stream.downloaded;
     
     if (stream.frames && stream.frames.length > 1) {
       thumbFrames.set(stream.url, stream.frames);
@@ -177,12 +308,12 @@ function renderStreams(streams, tabId) {
         <div class="download-section">
           <div class="btn-row">
             <button
-              class="btn-primary download-btn${isDownloaded ? ' btn-downloaded' : ''}"
+              class="btn-primary download-btn"
               data-url="${escapeHtml(stream.url)}"
               data-tab="${tabId}"
-              ${(isDownloading || isDownloaded) ? 'disabled' : ''}
+              ${isDownloading ? 'disabled' : ''}
             >
-              ${isDownloading ? '⏳ Downloading...' : isDownloaded ? '✅ Downloaded' : '⬇️ Download as MP4'}
+              ${isDownloading ? '⏳ Downloading...' : '⬇️ Download as MP4'}
             </button>
             ${isDownloading ? `<button class="btn-danger cancel-btn" data-url="${escapeHtml(stream.url)}">✕ Cancel</button>` : ''}
           </div>
@@ -213,6 +344,72 @@ function renderStreams(streams, tabId) {
   });
 
   document.querySelectorAll('img.stream-thumb').forEach(attachThumbHover);
+}
+
+/**
+ * Called when zero streams were found by the normal network-based
+ * detectors. Asks background.js to inject a scan of the page's actual
+ * <video>/<audio> elements — the only way to see media assembled in-page
+ * via MediaSource Extensions (blob: src), which never crosses the network
+ * as one request the webRequest listeners could catch.
+ */
+async function scanForOtherMedia(tabId) {
+  const resultEl = document.getElementById('mediaScanResult');
+  if (!resultEl) return; // popup moved on before this resolved
+
+  resultEl.innerHTML = `<div style="text-align:center; padding: 12px; font-size: 12px; opacity: 0.6;">Checking for other video on this page…</div>`;
+
+  const response = await chrome.runtime.sendMessage({ action: 'scanForMediaElements', tabId });
+  renderMediaScanResults(response.elements || []);
+}
+
+const SOURCE_TYPE_LABELS = {
+  'media-source': { label: 'Custom player (MediaSource)', note: 'Video is being assembled in-page by the site\'s own player — common for hls.js, dash.js, or Shaka Player. Not a plain network file, so it can\'t be grabbed the way HLS/DASH/direct files are.' },
+  'blob-url': { label: 'Blob URL', note: 'The video source is a blob: URL, valid only inside this page — not something the extension can fetch directly.' },
+  'blob-object': { label: 'Blob object', note: 'Video source is an in-memory object set directly on the element, not a fetchable URL.' },
+  'media-stream': { label: 'Live stream (camera/WebRTC)', note: 'This is a live media stream, not a file — there\'s nothing to download.' },
+  'data-url': { label: 'Data URL', note: 'Video is embedded directly in the page as a data: URL.' },
+  'network-url': { label: 'Plain network URL', note: 'This has a normal HTTP(S) source — if it isn\'t showing up as a downloadable stream above, it may be below the size floor or not yet finished loading.' }
+};
+
+function renderMediaScanResults(elements) {
+  const resultEl = document.getElementById('mediaScanResult');
+  if (!resultEl) return;
+
+  if (elements.length === 0) {
+    resultEl.innerHTML = `
+      <div style="text-align:center; padding: 12px; font-size: 12px; opacity: 0.6;">
+        No &lt;video&gt;/&lt;audio&gt; elements found on this page either.
+      </div>
+    `;
+    return;
+  }
+
+  resultEl.innerHTML = `
+    <div style="padding: 8px 4px 4px; font-size: 11px; color: #888; text-transform: uppercase; letter-spacing: 0.5px;">
+      Found on this page (not directly downloadable)
+    </div>
+    ${elements.map((el) => {
+      const info = SOURCE_TYPE_LABELS[el.sourceType] || { label: el.sourceType, note: '' };
+      const dims = el.width && el.height ? `${el.width}×${el.height}` : null;
+      const duration = el.duration ? formatDuration(el.duration) : null;
+
+      return `
+        <div class="media-scan-item" style="border: 1px solid #3d3d3d; border-radius: 8px; padding: 10px 12px; margin: 6px 4px; background: #212121;">
+          <div style="display:flex; align-items:center; gap: 8px; margin-bottom: 4px;">
+            <span style="font-size: 13px; font-weight: 600;">${el.tag === 'audio' ? '🔊' : '🎬'} ${escapeHtml(info.label)}</span>
+            ${!el.visible ? '<span style="font-size: 10px; opacity: 0.6;">(hidden)</span>' : ''}
+          </div>
+          <div style="font-size: 11px; color: #999; line-height: 1.5;">
+            ${[dims, duration, el.paused ? 'paused' : 'playing'].filter(Boolean).join(' · ')}
+          </div>
+          ${info.note ? `<div style="font-size: 11px; color: #777; margin-top: 6px;">${escapeHtml(info.note)}</div>` : ''}
+          ${el.currentSrc && el.sourceType === 'network-url' ? `<div style="font-size: 10px; color: #666; margin-top: 6px; word-break: break-all;">${escapeHtml(el.currentSrc)}</div>` : ''}
+          ${el.frameUrl ? `<div style="font-size: 10px; color: #666; margin-top: 4px;">In embedded frame: ${escapeHtml(el.frameUrl)}</div>` : ''}
+        </div>
+      `;
+    }).join('')}
+  `;
 }
 
 /**
@@ -258,12 +455,29 @@ async function startDownload(url, tabId) {
   renderStreams(response.streams || [], tab.id);
   
   // Start download in background
-  await chrome.runtime.sendMessage({
+  const result = await chrome.runtime.sendMessage({
     action: 'startDownload',
     url: url,
     filename: filename,
     tabId: parseInt(tabId)
   });
+
+  if (result && result.rateLimited) {
+    // Never actually started — undo the optimistic "downloading" UI state
+    activeDownloadsUI.delete(url);
+    const minutes = Math.max(1, Math.ceil(result.resetInMs / 60000));
+    setStatus(
+      url,
+      'status-error',
+      `⏳ Free plan limit reached (${result.limit}/hour). Resets in ~${minutes} min — upgrade for unlimited downloads.`
+    );
+
+    const btn = document.querySelector(`button[data-url="${CSS.escape(url)}"]`);
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = '⬇️ Download';
+    }
+  }
 }
 
 function updateDownloadProgress(url, progress) {
@@ -319,15 +533,11 @@ function onDownloadComplete(url, result) {
     statusEl.textContent = `✅ Download complete: ${result.filename}`;
   }
   
-  // Lock the button rather than re-enabling it — the file is already saved,
-  // so offering "Download as MP4" again invites a confusing duplicate.
-  // background.js persists this on the stream record too, so it stays
-  // locked even if the popup is closed and reopened.
+  // Re-enable button
   const btn = document.querySelector(`button[data-url="${CSS.escape(url)}"]`);
   if (btn) {
-    btn.disabled = true;
-    btn.textContent = '✅ Downloaded';
-    btn.classList.add('btn-downloaded');
+    btn.disabled = false;
+    btn.textContent = '⬇️ Download as MP4';
   }
 }
 

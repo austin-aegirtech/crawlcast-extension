@@ -2,11 +2,13 @@
 <html>
 <head><meta charset="UTF-8"></head>
 <body>
-  <!-- Offscreen document: runs the HLS download/transmux pipeline,
+  <!-- Offscreen document: runs the HLS/DASH download/transmux pipeline,
        since the MV3 service worker has no DOM and no URL.createObjectURL -->
   <script src="lib/mux.min.js"></script>
   <script src="m3u8-parser.js"></script>
   <script src="downloader.js"></script>
+  <script src="dash-parser.js"></script>
+  <script src="dash-downloader.js"></script>
   <script src="offscreen.js"></script>
 </body>
 </html>

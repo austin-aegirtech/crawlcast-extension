@@ -1,5 +1,27 @@
 // Download pipeline runs in offscreen.html (service workers have no DOM);
 // this worker only detects streams and brokers messages.
+importScripts('telemetry.js', 'auth.js', 'license.js', 'rateLimit.js');
+
+// ---------------------------------------------------------------------------
+// Auth gate (private test period)
+//
+// Crawlcast is gated behind login while it's limited to a small test group.
+// Session state mirrors the streams pattern below it: an in-memory copy plus
+// a restore promise, backed by chrome.storage.session so it survives worker
+// suspension but clears when the browser fully closes — testers sign in
+// again each browser session, per the agreed design.
+//
+// The popup performs the actual login (see auth.js / popup.js) and then
+// sends 'authChanged' so this worker's in-memory copy updates immediately,
+// rather than waiting for the next restart to re-read storage.
+// ---------------------------------------------------------------------------
+let authSession = null;
+const authRestored = getAuthSession().then((session) => { authSession = session; });
+
+function isAuthenticated() {
+  return !!authSession;
+}
+
 // Store detected streams
 const detectedStreams = new Map();
 const activeDownloads = new Map();
@@ -8,6 +30,13 @@ const activeDownloads = new Map();
 // Once finished we tell the offscreen doc to revoke them — otherwise every
 // downloaded video stays in memory for the life of the offscreen document.
 const pendingBlobUrls = new Map();
+
+// Progressive (whole-file) downloads waiting for chrome.downloads to finish.
+// Unlike the Blob-based HLS/DASH downloads, these were never assembled in
+// memory — chrome.downloads.download() streams them straight from the
+// network to disk — so there's no blob to release and no remux step
+// (the file is already a complete, unfragmented container).
+const pendingProgressiveDownloads = new Map(); // downloadId -> { streamUrl, filename, startTime }
 
 chrome.downloads.onChanged.addListener((delta) => {
   const state = delta.state && delta.state.current;
@@ -20,6 +49,30 @@ chrome.downloads.onChanged.addListener((delta) => {
   if (state === 'complete' && entry) {
     remuxDownloadedFile(delta.id, entry.streamUrl).catch((e) =>
       console.log('[Remux] Skipped:', e.message));
+  }
+
+  const progressiveEntry = pendingProgressiveDownloads.get(delta.id);
+  if (progressiveEntry) {
+    pendingProgressiveDownloads.delete(delta.id);
+    activeDownloads.delete(progressiveEntry.streamUrl);
+
+    if (state === 'complete') {
+      trackEvent('download_complete', {
+        ms: Date.now() - progressiveEntry.startTime,
+        format: 'progressive'
+      });
+      chrome.runtime.sendMessage({
+        action: 'downloadComplete',
+        url: progressiveEntry.streamUrl,
+        result: { filename: progressiveEntry.filename }
+      }).catch(() => {});
+    } else {
+      chrome.runtime.sendMessage({
+        action: 'downloadError',
+        url: progressiveEntry.streamUrl,
+        error: 'Download interrupted'
+      }).catch(() => {});
+    }
   }
 });
 
@@ -76,12 +129,14 @@ async function remuxDownloadedFile(downloadId, streamUrl) {
 
   port.onMessage.addListener((msg) => {
     if (msg.type === 'remuxed') {
+      trackEvent('remux_complete', { bytes: msg.bytes || 0, merged: !!msg.merged });
       broadcast({
         action: 'remuxComplete', url: streamUrl, path: msg.path, merged: !!msg.merged
       });
       port.disconnect();
     } else if (msg.type === 'remuxSkipped' || msg.type === 'error') {
       console.log('[Remux] Skipped:', msg.message);
+      trackEvent('remux_skipped', {});
       broadcast({ action: 'remuxSkipped', url: streamUrl, message: msg.message });
       port.disconnect();
     }
@@ -178,41 +233,98 @@ function persistStreams() {
   chrome.storage.session.set({ detectedStreams: Array.from(detectedStreams.entries()) });
 }
 
-// Pattern to match m3u8 URLs
+// Patterns to match stream manifest URLs
 const M3U8_PATTERN = /\.m3u8($|\?)/i;
+const MPD_PATTERN = /\.mpd($|\?)/i;
+
+/** Register a newly-detected stream, shared by every detection listener below. */
+function registerDetectedStream(details, format, extra = {}) {
+  const url = details.url;
+  if (detectedStreams.has(url)) return;
+
+  const streamInfo = {
+    url: url,
+    format: format,
+    timestamp: Date.now(),
+    tabId: details.tabId,
+    type: details.type,
+    initiator: details.initiator || 'unknown',
+    title: null, // Will be populated from page
+    ...extra
+  };
+
+  detectedStreams.set(url, streamInfo);
+
+  // Limit storage size
+  if (detectedStreams.size > 50) {
+    const oldestKey = detectedStreams.keys().next().value;
+    detectedStreams.delete(oldestKey);
+  }
+
+  persistStreams();
+  updateBadge(details.tabId);
+  trackEvent('stream_detected', { host: new URL(url).hostname, format });
+  console.log(`[Stream Detector] Found (${format}):`, url);
+}
 
 // Listen for network requests
 chrome.webRequest.onBeforeRequest.addListener(
   (details) => {
+    // if (!authSession) return; // gated until the test-group login succeeds
 
-    const url = details.url;
-    
-    if (detectedStreams.has(url)) return;
-    if (!M3U8_PATTERN.test(url)) return;
+    if (detectedStreams.has(details.url)) return;
 
-    const streamInfo = {
-      url: url,
-      timestamp: Date.now(),
-      tabId: details.tabId,
-      type: details.type,
-      initiator: details.initiator || 'unknown',
-      title: null // Will be populated from page
-    };
-    
-    detectedStreams.set(url, streamInfo);
-
-    // Limit storage size
-    if (detectedStreams.size > 50) {
-      const oldestKey = detectedStreams.keys().next().value;
-      detectedStreams.delete(oldestKey);
-    }
-
-    persistStreams();
-    updateBadge(details.tabId);
-    console.log('[M3U8 Detector] Found:', url);
+    if (M3U8_PATTERN.test(details.url)) registerDetectedStream(details, 'hls');
+    else if (MPD_PATTERN.test(details.url)) registerDetectedStream(details, 'dash');
   },
   { urls: ["<all_urls>"] },
   ["requestBody"]
+);
+
+// ---------------------------------------------------------------------------
+// Progressive (whole-file) video detection: .mp4/.webm served directly, not
+// as HLS/DASH segments.
+//
+// Both the extension check and the Content-Type fallback live in THIS one
+// onHeadersReceived listener, rather than an extension check at
+// onBeforeRequest plus a header check afterward. Splitting them would let
+// extension-matched files skip the size floor entirely, since
+// Content-Length isn't available until headers arrive — keeping both checks
+// at the header stage means every progressive candidate is filtered the
+// same way, regardless of which signal caught it.
+//
+// Restricted to resourceType 'media' — requests an HTML5 <video>/<source>
+// element makes directly. HLS/DASH segment fetches (including our own
+// downloader's) go through fetch()/XHR, resourceType 'xmlhttprequest',
+// which this deliberately excludes — otherwise every DASH init segment or
+// HLS fragment literally named *.mp4 would be flagged as its own
+// "detected stream".
+// ---------------------------------------------------------------------------
+const PROGRESSIVE_EXTENSION_PATTERN = /\.(mp4|webm)($|\?)/i;
+const MIN_PROGRESSIVE_BYTES = 1 * 1024 * 1024; // 1 MB floor — filters ad pixels, UI sounds, preview clips
+
+chrome.webRequest.onHeadersReceived.addListener(
+  (details) => {
+    //if (details.type !== 'media') return;
+    if (detectedStreams.has(details.url)) return;
+
+    const headers = details.responseHeaders || [];
+    const contentType = (headers.find(h => h.name.toLowerCase() === 'content-type') || {}).value || '';
+
+    const extensionMatch = PROGRESSIVE_EXTENSION_PATTERN.test(details.url);
+    const contentTypeMatch = /^video\/(mp4|webm)/i.test(contentType);
+    if (!extensionMatch && !contentTypeMatch) return;
+
+    const contentLengthHeader = (headers.find(h => h.name.toLowerCase() === 'content-length') || {}).value;
+    const bytes = contentLengthHeader ? parseInt(contentLengthHeader, 10) : null;
+    // Only filter when size is actually known — an unknown size can't be
+    // judged, so it's let through rather than silently hidden
+    if (bytes !== null && bytes < MIN_PROGRESSIVE_BYTES) return;
+
+    registerDetectedStream(details, 'progressive', { bytes });
+  },
+  { urls: ["<all_urls>"] },
+  ["responseHeaders", "extraHeaders"]
 );
 
 // Update badge
@@ -229,6 +341,12 @@ async function updateBadge(tabId) {
 // Message handlers
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
+  // Popup just logged in or out — update our in-memory copy immediately,
+  // rather than waiting for the next worker restart to re-read storage.
+  if (request.action === 'authChanged') {
+    authSession = request.session || null;
+    return false;
+  }
 
   // Log entry forwarded from the offscreen document
   if (request.action === 'log') {
@@ -251,6 +369,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
   // Get streams for popup
   if (request.action === 'getStreams') {
+    if (!isAuthenticated()) { sendResponse({ streams: [], authRequired: true }); return; }
     streamsRestored.then(() => {
       const streams = Array.from(detectedStreams.values())
         .filter(s => s.tabId === request.tabId)
@@ -260,10 +379,38 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         .map(s => ({ ...s, downloading: activeDownloads.has(s.url) }));
       sendResponse({ streams });
     });
+    return true;
+  }
+
+  // On-demand scan for <video>/<audio> elements the network-based detectors
+  // couldn't see — most commonly blob:/MediaSource players (hls.js, dash.js,
+  // Shaka, or a fully custom player), where the actual media data is
+  // assembled in-page and never crosses the network as one identifiable
+  // request. Only run when asked (popup found nothing via the normal
+  // detectors) — this is a real page injection, not something to do on
+  // every tab all the time.
+  if (request.action === 'scanForMediaElements') {
+    if (!isAuthenticated()) { sendResponse({ elements: [], authRequired: true }); return; }
+
+    chrome.scripting.executeScript({
+      target: { tabId: request.tabId, allFrames: true },
+      func: scanPageForMediaElements
+    }).then((injectionResults) => {
+      // One result per frame; flatten, dropping frames that errored or had nothing
+      const elements = injectionResults
+        .flatMap(r => r.result || [])
+        .filter(Boolean);
+      sendResponse({ elements });
+    }).catch((err) => {
+      console.warn('[MediaScan] Injection failed:', err.message);
+      sendResponse({ elements: [], error: err.message });
+    });
+    return true;
   }
 
   // Clear streams
   if (request.action === 'clearStreams') {
+    if (!isAuthenticated()) { sendResponse({ success: false, authRequired: true }); return; }
     console.log('clear streams');
     streamsRestored.then(() => {
       for (const [url, stream] of detectedStreams) {
@@ -298,14 +445,48 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
   // Start download
   if (request.action === 'startDownload') {
-    startDownload(request.url, request.filename, sender.tab?.id || request.tabId);
-    sendResponse({ success: true, downloadId: request.url });
+    if (!isAuthenticated()) { sendResponse({ success: false, authRequired: true }); return true; }
+
+    canStartDownload().then((gate) => {
+      if (!gate.allowed) {
+        sendResponse({
+          success: false,
+          rateLimited: true,
+          limit: gate.limit,
+          resetInMs: gate.resetInMs
+        });
+        return;
+      }
+      recordDownloadStart();
+      startDownload(request.url, request.filename, sender.tab?.id || request.tabId);
+      sendResponse({ success: true, downloadId: request.url, remaining: gate.remaining - 1, limit: gate.limit });
+    });
+    return true;
   }
 
   // Start download via the external downloader bridge
   if (request.action === 'startExternalDownload') {
+    if (!isAuthenticated()) { sendResponse({ success: false, authRequired: true }); return true; }
     startExternalDownload(request.url);
     sendResponse({ success: true });
+  }
+
+  // Popup's Upgrade button: open Stripe checkout in a new tab
+  if (request.action === 'startCheckout') {
+    startCheckout()
+      .then(() => sendResponse({ success: true }))
+      .catch((err) => sendResponse({ success: false, error: err.message }));
+    return true;
+  }
+
+  // Popup asking for current license status — forceRefresh bypasses the
+  // cache (used right after the popup regains focus, in case a checkout
+  // tab was just closed)
+  if (request.action === 'getLicenseStatus') {
+    (request.forceRefresh ? refreshLicenseStatus() : getCachedLicenseStatus())
+      .then((status) => sendResponse(status))
+      .catch(() => sendResponse({ licensed: false }));
+    return true;
   }
 
   // Offscreen finished: save the blob via the downloads API
@@ -350,16 +531,13 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         streamUrl: request.streamUrl
       });
 
-      // Persist completion on the stream record itself so the button still
-      // shows "already downloaded" after the popup is closed and reopened,
-      // not just for the rest of this popup session.
-      const streamRec = detectedStreams.get(request.streamUrl);
-      if (streamRec) {
-        streamRec.downloaded = true;
-        persistStreams();
-      }
-
       const stats = request.stats || {};
+      trackEvent('download_complete', {
+        bytes: stats.bytesDownloaded || 0,
+        segments: stats.downloaded || 0,
+        failedSegments: stats.failed || 0,
+        ms: info ? Date.now() - info.startTime : 0
+      });
 
       chrome.runtime.sendMessage({
         action: 'downloadComplete',
@@ -401,11 +579,13 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   // (the popup receives the same broadcast directly)
   if (request.action === 'downloadError') {
     activeDownloads.delete(request.url);
+    trackEvent('download_error', { message: String(request.error).slice(0, 200) });
     maybeCloseOffscreen();
   }
 
   // Popup asks for thumbnails of streams that don't have one yet
   if (request.action === 'generateThumbnails') {
+    if (!isAuthenticated()) { sendResponse({ started: 0, authRequired: true }); return; }
     streamsRestored.then(async () => {
       const targets = (request.urls || []).filter((url) => {
         const s = detectedStreams.get(url);
@@ -421,7 +601,8 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       targets.forEach((url) => thumbnailJobs.add(url));
       await ensureOffscreenDocument();
       for (const url of targets) {
-        chrome.runtime.sendMessage({ target: 'offscreen', action: 'generateThumbnail', url })
+        const format = detectedStreams.get(url)?.format || 'hls';
+        chrome.runtime.sendMessage({ target: 'offscreen', action: 'generateThumbnail', url, format })
           .catch(() => { thumbnailJobs.delete(url); });
       }
       sendResponse({ started: targets.length });
@@ -451,6 +632,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         if (request.frames) stream.frames = request.frames; // hover animation frames
         persistStreams();
       }
+      trackEvent('thumbnail_generated', { ok: !!request.thumbnail });
       maybeCloseOffscreen();
     });
   }
@@ -460,6 +642,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   // so forward the request there; also release our own tracking immediately
   // so a wedged offscreen doc can never lock the UI permanently.
   if (request.action === 'cancelDownload') {
+    if (!isAuthenticated()) { sendResponse({ success: false, authRequired: true }); return true; }
     activeDownloads.delete(request.url);
     chrome.runtime.sendMessage({
       target: 'offscreen',
@@ -483,7 +666,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 // it only opens the pipe and relays progress.
 // ---------------------------------------------------------------------------
 
-const NATIVE_HOST = 'com.crawlcast.downloader';
+const NATIVE_HOST = 'com.miteruno.downloader';
 
 function startExternalDownload(url) {
   let port;
@@ -501,10 +684,12 @@ function startExternalDownload(url) {
       broadcast({ action: 'externalProgress', url, percent: msg.percent, line: msg.line });
     } else if (msg.type === 'done') {
       activeDownloads.delete(url);
+      trackEvent('external_download_complete', {});
       broadcast({ action: 'externalComplete', url, filename: msg.filename });
       port.disconnect();
     } else if (msg.type === 'error') {
       activeDownloads.delete(url);
+      trackEvent('external_download_error', { message: String(msg.message).slice(0, 200) });
       broadcast({ action: 'externalError', url, error: msg.message });
       port.disconnect();
     }
@@ -521,6 +706,8 @@ function startExternalDownload(url) {
       });
     }
   });
+
+  trackEvent('external_download_start', {});
   port.postMessage({ url });
 }
 
@@ -529,6 +716,77 @@ function buildRemuxMessage(videoPath, audio) {
   return (audio && audio.audioPath)
     ? { action: 'remux', path: videoPath, audioPath: audio.audioPath }
     : { action: 'remux', path: videoPath };
+}
+
+/**
+ * Injected into the page (via chrome.scripting.executeScript) when the
+ * network-based detectors found nothing. Inspects every <video>/<audio>
+ * element directly — the only way to see media that's being assembled
+ * in-page via MediaSource Extensions (blob: src), which never crosses the
+ * network as one request our webRequest listeners could attribute.
+ *
+ * Must be fully self-contained: this function is serialized and re-run
+ * inside the page's own context, so it can't reference anything from
+ * background.js's outer scope.
+ *
+ * @returns {Array<Object>} one entry per <video>/<audio> element found
+ */
+function scanPageForMediaElements() {
+  function classifySource(el) {
+    if (el.srcObject) {
+      if (typeof MediaSource !== 'undefined' && el.srcObject instanceof MediaSource) {
+        return 'media-source'; // hls.js / dash.js / Shaka / custom MSE player
+      }
+      if (typeof MediaStream !== 'undefined' && el.srcObject instanceof MediaStream) {
+        return 'media-stream'; // live camera/mic or WebRTC — not a file to download
+      }
+      return 'blob-object'; // srcObject set to something else (rare)
+    }
+    if (el.currentSrc) {
+      if (el.currentSrc.startsWith('blob:')) return 'blob-url';
+      if (el.currentSrc.startsWith('data:')) return 'data-url';
+      if (/^https?:\/\//i.test(el.currentSrc)) return 'network-url'; // network detectors should have caught this — flagged separately below
+    }
+    return 'no-source';
+  }
+
+  function describe(el, tag) {
+    const rect = el.getBoundingClientRect();
+    const sourceType = classifySource(el);
+
+    return {
+      tag, // 'video' | 'audio'
+      sourceType,
+      // blob: URLs are only valid within the page that created them — not
+      // fetchable from the extension — but the string itself is still
+      // useful to show, so the user can see this isn't a dead end, just a
+      // different kind of dead end.
+      currentSrc: sourceType === 'network-url' ? el.currentSrc : (el.currentSrc || null),
+      width: el.videoWidth || null,
+      height: el.videoHeight || null,
+      duration: isFinite(el.duration) ? el.duration : null,
+      readyState: el.readyState,
+      paused: el.paused,
+      muted: el.muted,
+      poster: tag === 'video' ? (el.poster || null) : null,
+      visible: rect.width > 0 && rect.height > 0 &&
+               getComputedStyle(el).display !== 'none' &&
+               getComputedStyle(el).visibility !== 'hidden',
+      pageUrl: location.href,
+      frameUrl: location.href !== window.top?.location?.href ? location.href : null
+    };
+  }
+
+  const results = [];
+
+  document.querySelectorAll('video').forEach((el) => results.push(describe(el, 'video')));
+  document.querySelectorAll('audio').forEach((el) => results.push(describe(el, 'audio')));
+
+  // Drop elements with genuinely nothing going on (no source, zero-size,
+  // never loaded) — almost always leftover template markup, not real
+  // players. Keep everything else, even if not currently visible, since a
+  // player can be legitimately hidden behind a "click to play" overlay.
+  return results.filter((r) => r.sourceType !== 'no-source' || r.readyState > 0);
 }
 
 function broadcast(message) {
@@ -540,6 +798,19 @@ function broadcast(message) {
  * which has the DOM APIs (Blob, URL.createObjectURL) the pipeline needs.
  */
 async function startDownload(url, filename, tabId) {
+  // Look up the format recorded at detection time — HLS if unknown, since
+  // every stream detected before DASH support existed predates this field.
+  const format = detectedStreams.get(url)?.format || 'hls';
+
+  // Progressive (whole-file) downloads skip the offscreen Blob pipeline
+  // entirely: there's nothing to fetch-and-assemble, since the file is
+  // already a complete, playable container. chrome.downloads.download()
+  // streams it straight to disk via Chrome's own network stack, with no
+  // in-memory size limit.
+  if (format === 'progressive') {
+    return startProgressiveDownload(url, filename);
+  }
+
   // Register before the await so maybeCloseOffscreen() can't close
   // the document out from under a download that's about to start
   activeDownloads.set(url, {
@@ -548,13 +819,42 @@ async function startDownload(url, filename, tabId) {
   });
 
   await ensureOffscreenDocument();
+  trackEvent('download_start', { format });
 
   chrome.runtime.sendMessage({
     target: 'offscreen',
     action: 'downloadStream',
     url: url,
-    filename: filename || 'video.mp4'
+    filename: filename || 'video.mp4',
+    format: format
   }).catch((err) => console.error('[Offscreen] send failed:', err));
+}
+
+async function startProgressiveDownload(url, filename) {
+  activeDownloads.set(url, { startTime: Date.now() });
+  trackEvent('download_start', { format: 'progressive' });
+
+  try {
+    const downloadId = await chrome.downloads.download({
+      url,
+      filename: filename || 'video.mp4'
+    });
+    // Completion/interruption is reported by the shared chrome.downloads
+    // .onChanged listener above, once the file has actually finished
+    // writing to disk — resolving here only means the download STARTED.
+    pendingProgressiveDownloads.set(downloadId, {
+      streamUrl: url,
+      filename: filename || 'video.mp4',
+      startTime: Date.now()
+    });
+  } catch (err) {
+    activeDownloads.delete(url);
+    chrome.runtime.sendMessage({
+      action: 'downloadError',
+      url,
+      error: err.message
+    }).catch(() => {});
+  }
 }
 
 async function ensureOffscreenDocument() {

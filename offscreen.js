@@ -38,7 +38,7 @@ chrome.runtime.onMessage.addListener((request) => {
   if (request.target !== 'offscreen') return;
 
   if (request.action === 'downloadStream') {
-    startDownload(request.url, request.filename);
+    startDownload(request.url, request.filename, request.format || 'hls');
   }
 
   // Abort an in-flight download and drop its buffered chunks
@@ -62,7 +62,7 @@ chrome.runtime.onMessage.addListener((request) => {
 
   // Generate a thumbnail for a detected stream (lazy, requested via popup)
   if (request.action === 'generateThumbnail') {
-    generateThumbnail(request.url)
+    generateThumbnail(request.url, request.format)
       .then((frames) => {
         chrome.runtime.sendMessage({
           action: 'thumbnailReady',
@@ -80,14 +80,36 @@ chrome.runtime.onMessage.addListener((request) => {
 });
 
 /**
- * Build a small preview of a stream: fetch the playlist (lowest-bandwidth
+ * Build a small preview of a stream. Dispatches on format: HLS goes through
+ * the playlist-fetch-and-sample path below; a progressive (whole-file) URL
+ * is already directly playable, so it skips straight to frame capture.
+ * @returns {Promise<string[]>} JPEG data URLs (frame 0 = static thumbnail)
+ */
+async function generateThumbnail(url, format) {
+  if (format === 'progressive') return generateProgressiveThumbnail(url);
+  return generateHlsThumbnail(url);
+}
+
+/**
+ * Progressive files need no playlist fetch or segment sampling — the URL is
+ * already a complete, directly playable file, so the same captureFrames()
+ * helper used per-segment for HLS can just point straight at it.
+ */
+async function generateProgressiveThumbnail(url) {
+  const frames = await captureFrames(url, 8);
+  if (frames.length === 0) throw new Error('No frames captured');
+  return frames;
+}
+
+/**
+ * HLS preview: fetch the playlist (lowest-bandwidth
  * variant — cheapest), then sample up to 8 segments EVENLY SPREAD across
  * the whole video and capture one mid-frame from each. Hovering the
  * thumbnail then scrubs through the entire video, not just its first
  * few seconds.
  * @returns {Promise<string[]>} JPEG data URLs (frame 0 = static thumbnail)
  */
-async function generateThumbnail(url) {
+async function generateHlsThumbnail(url) {
   const parser = new M3U8Parser();
 
   const resp = await fetch(url);
@@ -266,8 +288,8 @@ function captureFrames(src, frameCount = 8) {
 // Live VideoDownloader instances, so cancel requests can reach them
 const runningDownloads = new Map();
 
-function startDownload(url, filename) {
-  const downloader = new VideoDownloader({
+function startDownload(url, filename, format) {
+  const callbacks = {
     onProgress: (progress) => {
       chrome.runtime.sendMessage({
         action: 'downloadProgress',
@@ -297,6 +319,7 @@ function startDownload(url, filename) {
         blobUrl: blobUrl,
         filename: result.filename,
         streamUrl: url,
+        stats: result.stats, // forwarded to background for metrics
         audioBlobUrl,
         audioFilename,
         needsAudioMerge: !!result.needsAudioMerge,
@@ -314,7 +337,15 @@ function startDownload(url, filename) {
         tooLarge: !!error.tooLarge // popup offers the bridge handoff
       }).catch(() => {});
     }
-  });
+  };
+
+  // DASH and HLS are different enough downstream (byte-range fetches,
+  // separate-audio-as-the-default-case, no shared transmuxer state) that
+  // they're handled by two independent classes rather than one branching
+  // implementation — see dash-downloader.js header for the reasoning.
+  const downloader = format === 'dash'
+    ? new DashDownloader(callbacks)
+    : new VideoDownloader(callbacks);
 
   runningDownloads.set(url, downloader);
   downloader.download(url, filename);

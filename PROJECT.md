@@ -2,7 +2,7 @@
 
 > **Running document.** Update the [Change Log](#14-change-log) whenever behaviour
 > changes, and keep [Known Limitations](#12-known-limitations--trade-offs) honest.
-> Last updated: 2026-08-04 · Extension version 1.0.0 (Himitsu)
+> Last updated: 2026-08-04 · Extension version 1.0.0 (Crawlcast)
 
 ---
 
@@ -17,6 +17,7 @@
 7. [MP4 Container Internals](#7-mp4-container-internals)
 8. [Thumbnails & Previews](#8-thumbnails--previews)
 9. [The Native Host](#9-the-native-host)
+10. [Telemetry & Metrics Dashboard](#10-telemetry--metrics-dashboard)
 11. [Message Protocol Reference](#11-message-protocol-reference)
 12. [Known Limitations & Trade-offs](#12-known-limitations--trade-offs)
 13. [Testing Notes](#13-testing-notes)
@@ -47,6 +48,7 @@ The extension does five distinct jobs:
 | Repair the saved file so it seeks properly | Native messaging host |
 | Hand large/unsupported videos to an external tool | Native messaging host |
 
+A sixth, optional component — a self-hosted metrics collector and dashboard —
 tracks usage across installs.
 
 Only the first three are self-contained. The native host requires a one-time
@@ -74,7 +76,7 @@ call each other directly; everything happens by message passing.
                             │ downloadStream            │ connectNative   │
                             ▼                           ▼                 │
                  ┌─────────────────────┐    ┌───────────────────────┐     │
-                 │    offscreen.js     │    │  crawlcast_host.py     │     │
+                 │    offscreen.js     │    │  miteruno_host.py     │     │
                  │  (offscreen.html)   │    │  (native host)        │     │
                  │                     │    │                       │     │
                  │  • VideoDownloader  │    │  • spawns yt-dlp      │     │
@@ -108,7 +110,7 @@ exists purely to provide DOM APIs the service worker lacks: `Blob`,
 `URL.createObjectURL`, `<video>`, `<canvas>`. All heavy lifting happens here.
 Created on demand, destroyed when idle.
 
-**Native host** (`crawlcast_host.py`) — a local process outside the browser
+**Native host** (`miteruno_host.py`) — a local process outside the browser
 entirely, reached over stdio. Handles cases the in-browser pipeline can't.
 
 ---
@@ -137,7 +139,7 @@ ceiling that motivates both the size guard and the external bridge.
 
 ## 4. File Map
 
-Line counts as of v1.0.0 (Himitsu).
+Line counts as of v1.0.0 (Crawlcast).
 
 **Extension core**
 
@@ -151,6 +153,7 @@ Line counts as of v1.0.0 (Himitsu).
 | `offscreen.html` | 12 | Loads mux.js, parser, downloader, glue |
 | `downloader.js` | 476 | `VideoDownloader` — fetch, transmux, assemble |
 | `m3u8-parser.js` | 196 | `M3U8Parser` — playlist parsing |
+| `telemetry.js` | 73 | Anonymous event batching |
 | `lib/mux.min.js` | — | mux.js 7.1.0 (TS→MP4 transmuxer) |
 
 
@@ -158,11 +161,13 @@ Line counts as of v1.0.0 (Himitsu).
 
 | File | Lines | Role |
 |---|---:|---|
-| `native-host/crawlcast_host.py` | 285 | Native host: external downloads **and** post-download remux |
-| `native-host/crawlcast_host.bat` | 5 | Windows launcher (Chrome can't exec `.py`) |
-| `native-host/com.crawlcast.downloader.json` | 9 | Native host manifest |
+| `native-host/miteruno_host.py` | 285 | Native host: external downloads **and** post-download remux |
+| `native-host/miteruno_host.bat` | 5 | Windows launcher (Chrome can't exec `.py`) |
+| `native-host/com.miteruno.downloader.json` | 9 | Native host manifest |
 | `tools/remux.sh` | 252 | Batch-repair existing files (bash) |
 | `tools/Repair-Videos.ps1` | 320 | Batch-repair + damage scan (PowerShell) |
+| `metrics-server/server.js` | 196 | Zero-dependency collector + API |
+| `metrics-server/dashboard.html` | 157 | Chart.js dashboard |
 | `PROJECT.md` | — | This document |
 
 ### Permissions and why each is needed
@@ -524,8 +529,8 @@ extension ◄── {"type": "error", "message": "..."}
 ```
 
 Binaries are configurable by environment variable, so nothing is hardcoded:
-`CRAWLCAST_DL_BIN` (default `yt-dlp`), `CRAWLCAST_FFMPEG_BIN` (`ffmpeg`),
-`CRAWLCAST_FFPROBE_BIN` (`ffprobe`).
+`MITERUNO_DL_BIN` (default `yt-dlp`), `MITERUNO_FFMPEG_BIN` (`ffmpeg`),
+`MITERUNO_FFPROBE_BIN` (`ffprobe`).
 
 ### 9.2 External downloads
 
@@ -599,12 +604,15 @@ those containers cannot hold an MP4 index.
 
 ---
 
+## 10. Telemetry & Metrics Dashboard
 
 Optional, self-hosted, zero-dependency.
 
+### Extension side (`telemetry.js`)
 
 An anonymous UUID is generated once and stored in `chrome.storage.local`. Events
 are queued in memory and flushed after 5 s of quiet or when 20 accumulate,
+whichever comes first. **All failures are swallowed** — telemetry must never
 disturb the extension.
 
 Events emitted: `extension_installed`, `stream_detected` (hostname only),
@@ -619,6 +627,7 @@ files with slow startup.
 **Privacy:** no stream URLs, no page URLs, no personal data. Publishing the
 extension would require disclosing this collection in a privacy policy.
 
+### Server side (`metrics-server/`)
 
 `server.js` uses only Node built-ins. Events append to `events.jsonl` (one JSON
 object per line — append-only, crash-safe, trivially greppable). Aggregation
@@ -636,6 +645,7 @@ duration) and four Chart.js charts (daily active installs, stacked events/day,
 bytes/day, version split) plus a recent-events table. Auto-refreshes every 30 s.
 
 Deployment (nginx reverse proxy + systemd) is documented in
+`metrics-server/README.md`.
 
 ---
 
@@ -735,7 +745,7 @@ read back `mvhd`/`tkhd`/`mdhd` and confirm each equals `duration × its timescal
 **Progress display** — assert 4127/4130 renders 99%, and only 4130/4130 renders 100%.
 
 **Native host — downloads** — pipe a length-prefixed message to
-`crawlcast_host.py` with `CRAWLCAST_DL_BIN` pointed at a mock script; assert
+`miteruno_host.py` with `MITERUNO_DL_BIN` pointed at a mock script; assert
 progress/done framing, plus the three failure modes (missing binary, bad URL,
 non-zero exit).
 
@@ -744,7 +754,7 @@ non-zero exit).
 `{action:'remux'}`, then assert the output has **zero `moof` boxes**, `moov`
 before `mdat`, an unchanged duration, the same filename, and no leftover
 `.remux.tmp` file. Failure paths: missing file, missing path, absent ffmpeg
-(via `CRAWLCAST_FFMPEG_BIN`), and a corrupt input — each must leave the original
+(via `MITERUNO_FFMPEG_BIN`), and a corrupt input — each must leave the original
 untouched.
 
 **`tools/remux.sh`** — a directory containing filenames with spaces and
@@ -752,6 +762,7 @@ parentheses, a `.ts` needing extension promotion, a corrupt file, plus empty and
 missing directories. Assert skip-existing, `-f`, `-r` (and that it prunes its
 own `remuxed/` output), and that `-i` swaps atomically.
 
+**Metrics server** — POST sample batches, assert distinct-install counts,
 byte totals, error rate, and per-day bucketing.
 
 ---
@@ -770,6 +781,8 @@ behaviour — nothing was reverted, only renamed.
 - **Retries raised from 3 to 20**, still linear backoff (`1000ms × attempt`).
   A stalled/flaky segment now gets substantially more chances before the
   downloader gives up on it and moves on.
+- **Telemetry endpoint switched to local** (`http://127.0.0.1:8787/collect`),
+  `ployan.me` commented out in `telemetry.js`. Temporary — pending an account
   password reset — not a change of collection intent.
 
 ---
@@ -826,6 +839,7 @@ behaviour — nothing was reverted, only renamed.
 - **Size guard.** Refuse in-browser downloads over 1.5 GB with a one-click
   handoff, instead of silently OOM-ing the offscreen document.
 - **External downloader bridge.** Native messaging host + popup panel.
+- **Telemetry + dashboard.** Anonymous batched events, self-hosted collector.
 - **Animated previews.** 8 frames spread across the whole video, 600 ms cycle
   on hover. (First cut sampled only the first segment — too narrow to read.)
 - **Download button state persisted.** `getStreams` now stamps `downloading`

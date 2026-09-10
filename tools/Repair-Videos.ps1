@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Repair and diagnose videos produced by the Crawlcast HLS pipeline.
+    Repair and diagnose videos produced by the Miteruno HLS pipeline.
 
 .DESCRIPTION
     Does two separate things, because there are two separate problems:

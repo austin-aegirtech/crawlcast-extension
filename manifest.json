@@ -9,7 +9,8 @@
     "activeTab",
     "downloads",
     "offscreen",
-    "nativeMessaging"
+    "nativeMessaging",
+    "scripting"
   ],
   "host_permissions": [
     "<all_urls>"
