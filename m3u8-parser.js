@@ -27,6 +27,10 @@ class M3U8Parser {
       variants: [],      // For master playlists (different qualities)
       media: [],         // EXT-X-MEDIA renditions (separate audio/subtitle tracks)
       segments: [],      // For media playlists (actual video chunks)
+      // fMP4/CMAF-packaged media playlists declare their init segment (the
+      // moov box every fragment depends on) via EXT-X-MAP rather than
+      // muxing it into each segment — see EXT-X-MAP handling below.
+      initSegmentUrl: null,
       metadata: {
         targetDuration: 0,
         mediaSequence: 0,
@@ -61,6 +65,18 @@ class M3U8Parser {
           // URI is absent when the track is muxed into the video segments
           url: a.URI ? this.resolveUrl(a.URI) : null
         });
+        continue;
+      }
+
+      // fMP4/CMAF media playlists point at their init segment (moov) here
+      // instead of muxing it into every fragment. Captures the most recent
+      // one seen — sufficient for the common case of one init segment per
+      // playlist; a playlist with multiple EXT-X-MAP entries across
+      // discontinuities would need per-segment tracking, which this does
+      // not attempt.
+      if (line.startsWith('#EXT-X-MAP:')) {
+        const a = this.parseAttributes(line.replace('#EXT-X-MAP:', ''));
+        if (a.URI) playlist.initSegmentUrl = this.resolveUrl(a.URI);
         continue;
       }
 

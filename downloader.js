@@ -117,7 +117,7 @@ class VideoDownloader {
       };
 
       // Step 5: Download and process segments
-      await this.downloadSegments(mediaPlaylist.segments, transmuxer, writer);
+      await this.downloadSegments(mediaPlaylist.segments, transmuxer, writer, mediaPlaylist.initSegmentUrl);
 
       // Step 6: Finalize — assembling a multi-GB Blob takes real time,
       // so tell the UI rather than sitting at 100% looking frozen
@@ -220,8 +220,17 @@ class VideoDownloader {
    * transmuxing/writing consumes results in playlist order (required —
    * the shared transmuxer corrupts output if segments arrive out of order).
    */
-  async downloadSegments(segments, transmuxer, writer) {
+  async downloadSegments(segments, transmuxer, writer, initSegmentUrl) {
     this.stats.totalSegments = segments.length;
+
+    // fMP4/CMAF segments carry no moov box of their own — it's declared
+    // separately via EXT-X-MAP. Without prepending it, the output file has
+    // no track/codec info at all and crashes on playback. TS segments
+    // don't need this; mux.js emits its own init segment for those.
+    let initSegmentBytes = null;
+    if (initSegmentUrl) {
+      initSegmentBytes = await this.fetchInitSegment(initSegmentUrl);
+    }
 
     const pending = new Map(); // index -> Promise<ArrayBuffer|null>
 
@@ -248,6 +257,9 @@ class VideoDownloader {
       if (isTS) {
         // Transmux TS to MP4
         mp4Data = await this.transmuxSegment(arrayBuffer, transmuxer, i === 0);
+      } else if (i === 0 && initSegmentBytes) {
+        // First fMP4 fragment — prepend the init segment fetched above
+        mp4Data = this.concatBytes(initSegmentBytes, new Uint8Array(arrayBuffer));
       } else {
         // Already MP4 or other format, pass through
         mp4Data = new Uint8Array(arrayBuffer);
@@ -258,6 +270,20 @@ class VideoDownloader {
       this.stats.downloaded++;
       this.reportProgress();
     }
+  }
+
+  /** Fetch an EXT-X-MAP init segment (the moov box fMP4 fragments depend on). */
+  async fetchInitSegment(url) {
+    const response = await fetch(url, { signal: this.abortController.signal });
+    if (!response.ok) throw new Error(`HTTP ${response.status} fetching init segment`);
+    return new Uint8Array(await response.arrayBuffer());
+  }
+
+  concatBytes(a, b) {
+    const combined = new Uint8Array(a.byteLength + b.byteLength);
+    combined.set(a, 0);
+    combined.set(b, a.byteLength);
+    return combined;
   }
 
   /**
@@ -284,6 +310,12 @@ class VideoDownloader {
       close: async () => {}
     };
 
+    // Same fMP4/CMAF issue as the video path — see downloadSegments above
+    let initSegmentBytes = null;
+    if (audioPlaylist.initSegmentUrl) {
+      initSegmentBytes = await this.fetchInitSegment(audioPlaylist.initSegmentUrl);
+    }
+
     // Track audio progress separately so the UI can show a distinct phase
     const total = audioPlaylist.segments.length;
     let done = 0;
@@ -305,9 +337,14 @@ class VideoDownloader {
                     ` (first bytes ${view[0].toString(16)} ${view[1].toString(16)})`);
       }
 
-      const data = isTS
-        ? await this.transmuxSegment(buf, transmuxer, i === 0)
-        : new Uint8Array(buf);
+      let data;
+      if (isTS) {
+        data = await this.transmuxSegment(buf, transmuxer, i === 0);
+      } else if (i === 0 && initSegmentBytes) {
+        data = this.concatBytes(initSegmentBytes, view);
+      } else {
+        data = view;
+      }
 
       await writer.write(data);
       done++;
