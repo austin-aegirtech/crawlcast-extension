@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Miteruno native messaging host.
+Crawlcast native messaging host.
 
 A thin, general-purpose pipe between the Chrome extension and an external
 downloader program that the USER has installed on their own machine.
@@ -28,13 +28,13 @@ import subprocess
 import sys
 
 # The external program invoked for each request. Must already be installed
-# and on PATH (or given as an absolute path). Override with MITERUNO_DL_BIN.
-DOWNLOADER_BIN = os.environ.get("MITERUNO_DL_BIN", "yt-dlp")
+# and on PATH (or given as an absolute path). Override with CRAWLCAST_DL_BIN.
+DOWNLOADER_BIN = os.environ.get("CRAWLCAST_DL_BIN", "yt-dlp")
 
 # Used to repair fragmented MP4s produced by the in-browser pipeline.
 # Optional: if absent, files are simply left as they are.
-FFMPEG_BIN = os.environ.get("MITERUNO_FFMPEG_BIN", "ffmpeg")
-FFPROBE_BIN = os.environ.get("MITERUNO_FFPROBE_BIN", "ffprobe")
+FFMPEG_BIN = os.environ.get("CRAWLCAST_FFMPEG_BIN", "ffmpeg")
+FFPROBE_BIN = os.environ.get("CRAWLCAST_FFPROBE_BIN", "ffprobe")
 
 # Loudness normalization target, applied to every remuxed file that has an
 # audio track (two-pass EBU R128-style loudnorm). I=-16 LUFS matches common
@@ -109,7 +109,7 @@ def run_download(url, outdir=None):
     except FileNotFoundError:
         send_message({
             "type": "error",
-            "message": f"'{DOWNLOADER_BIN}' not found on PATH. Install it or set MITERUNO_DL_BIN.",
+            "message": f"'{DOWNLOADER_BIN}' not found on PATH. Install it or set CRAWLCAST_DL_BIN.",
         })
         return
     except Exception as exc:  # noqa: BLE001 - surface anything to the UI

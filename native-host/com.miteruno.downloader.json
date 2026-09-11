@@ -1,9 +1,0 @@
-{
-  "name": "com.miteruno.downloader",
-  "description": "Miteruno bridge to a locally installed downloader",
-  "path": "C:\\path\\to\\miteruno-host\\miteruno_host.bat",
-  "type": "stdio",
-  "allowed_origins": [
-    "chrome-extension://REPLACE_WITH_YOUR_EXTENSION_ID/"
-  ]
-}

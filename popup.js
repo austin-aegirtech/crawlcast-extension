@@ -159,7 +159,7 @@ function renderStreams(streams, tabId) {
           ${thumb}
           <div class="stream-body">
             <div class="stream-header">
-              <div class="stream-url">${escapeHtml(truncateUrl(stream.url, 70))}</div>
+              <a class="stream-url">${escapeHtml(stream.url)}</a>
               ${stream.type === 'xmlhttprequest' ? '<span class="quality-badge">XHR</span>' : ''}
             </div>
 

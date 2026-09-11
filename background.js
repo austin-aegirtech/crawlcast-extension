@@ -485,7 +485,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 // it only opens the pipe and relays progress.
 // ---------------------------------------------------------------------------
 
-const NATIVE_HOST = 'com.miteruno.downloader';
+const NATIVE_HOST = 'com.crawlcast.downloader';
 
 function startExternalDownload(url) {
   let port;

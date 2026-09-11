@@ -8,7 +8,6 @@
  * (stream_detected carries the page hostname only).
  */
 
-// const TELEMETRY_ENDPOINT = 'https://ployan.me/miteruno-metrics/collect';
 const TELEMETRY_ENDPOINT = 'http://127.0.0.1:8787/collect';
 const TELEMETRY_FLUSH_MS = 5000;   // debounce window before a batch is sent
 const TELEMETRY_MAX_BATCH = 20;    // flush immediately at this queue size

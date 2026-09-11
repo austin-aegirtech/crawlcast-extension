@@ -1,0 +1,9 @@
+{
+  "name": "com.crawlcast.downloader",
+  "description": "Crawlcast bridge to a locally installed downloader",
+  "path": "./crawlcast_host.bat",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://iekplklohmnmkoappjbnbhfgaojlobbj/"
+  ]
+}
