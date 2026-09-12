@@ -27,7 +27,6 @@ class VideoDownloader {
 
     // Per-attempt segment fetch timeout (ms). Guards against servers that
     // accept the connection then never send data.
-    console.log('OPTIONS :::', JSON.stringify(options));
     this.segmentTimeoutMs = options.segmentTimeoutMs || 30000;
 
     // Refuse in-browser downloads above this estimated size. Chunks plus the
@@ -97,7 +96,7 @@ class VideoDownloader {
         const err = new Error(
           `Video is too large for in-browser download ` +
           `(~${(estimate.bytes / 1e9).toFixed(1)} GB over ${mediaPlaylist.segments.length} segments). ` +
-          `Use the External downloader, which streams straight to disk.`
+          `This exceeds the in-browser memory limit.`
         );
         err.tooLarge = true;
         err.estimate = estimate;
@@ -108,8 +107,7 @@ class VideoDownloader {
       const transmuxer = this.initializeTransmuxer();
 
       // Step 4: Collect transmuxed MP4 fragments in memory
-      // (StreamSaver needs a DOM+iframe and can't run here; the final Blob
-      //  is handed to chrome.downloads via the background service worker)
+      // The final Blob is handed to chrome.downloads via the background service worker.
       const chunks = [];
       const writer = {
         write: async (data) => { chunks.push(data); },
@@ -170,7 +168,6 @@ class VideoDownloader {
    * Fetch and parse m3u8 playlist
    */
   async fetchPlaylist(url) {
-    console.log('fetchPlaylist :::');
     const response = await fetch(url, {
       signal: this.abortController.signal
     });

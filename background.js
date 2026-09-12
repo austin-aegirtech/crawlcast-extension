@@ -305,11 +305,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     sendResponse({ success: true, downloadId: request.url });
   }
 
-  // Start download via the external downloader bridge
-  if (request.action === 'startExternalDownload') {
-    startExternalDownload(request.url);
-    sendResponse({ success: true });
-  }
 
   // Offscreen finished: save the blob via the downloads API
   // (offscreen documents can't call chrome.downloads themselves)
@@ -477,58 +472,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 });
 
 // ---------------------------------------------------------------------------
-// External downloader bridge
-//
-// For URLs the in-browser HLS pipeline can't handle, hand the URL to a
-// downloader program the user has installed themselves, over native
-// messaging. This extension contains no site-specific extraction logic —
-// it only opens the pipe and relays progress.
+// Native remux host
 // ---------------------------------------------------------------------------
 
 const NATIVE_HOST = 'com.crawlcast.downloader';
-
-function startExternalDownload(url) {
-  let port;
-  try {
-    port = chrome.runtime.connectNative(NATIVE_HOST);
-  } catch (e) {
-    broadcast({ action: 'externalError', url, error: 'Native host not reachable: ' + e.message });
-    return;
-  }
-
-  activeDownloads.set(url, { external: true, startTime: Date.now() });
-
-  port.onMessage.addListener((msg) => {
-    if (msg.type === 'progress') {
-      broadcast({ action: 'externalProgress', url, percent: msg.percent, line: msg.line });
-    } else if (msg.type === 'done') {
-      activeDownloads.delete(url);
-      trackEvent('external_download_complete', {});
-      broadcast({ action: 'externalComplete', url, filename: msg.filename });
-      port.disconnect();
-    } else if (msg.type === 'error') {
-      activeDownloads.delete(url);
-      trackEvent('external_download_error', { message: String(msg.message).slice(0, 200) });
-      broadcast({ action: 'externalError', url, error: msg.message });
-      port.disconnect();
-    }
-  });
-
-  port.onDisconnect.addListener(() => {
-    const err = chrome.runtime.lastError;
-    if (activeDownloads.has(url)) {
-      activeDownloads.delete(url);
-      broadcast({
-        action: 'externalError',
-        url,
-        error: err ? err.message : 'Native host disconnected. Is it installed?'
-      });
-    }
-  });
-
-  trackEvent('external_download_start', {});
-  port.postMessage({ url });
-}
 
 /** Path the native host should be asked to operate on, plus the audio to merge */
 function buildRemuxMessage(videoPath, audio) {

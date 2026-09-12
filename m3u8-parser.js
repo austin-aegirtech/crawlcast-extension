@@ -147,8 +147,7 @@ class M3U8Parser {
       codecs: a.CODECS || null,
       frameRate: a['FRAME-RATE'] ? parseFloat(a['FRAME-RATE']) : null,
       // Group IDs linking this variant to EXT-X-MEDIA renditions
-      audioGroup: a.AUDIO || null,
-      subtitleGroup: a.SUBTITLES || null
+      audioGroup: a.AUDIO || null
     };
   }
 

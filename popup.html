@@ -82,46 +82,6 @@
       color: white;
     }
     
-    .external-panel {
-      padding: 12px 16px;
-      border-bottom: 1px solid #3d3d3d;
-      background: #212121;
-    }
-
-    .external-label {
-      font-size: 11px;
-      color: #888;
-      margin-bottom: 8px;
-    }
-
-    .external-row {
-      display: flex;
-      gap: 8px;
-    }
-
-    .external-row input {
-      flex: 1;
-      min-width: 0;
-      padding: 8px 10px;
-      border: 1px solid #3d3d3d;
-      border-radius: 6px;
-      background: #1a1a1a;
-      color: #fff;
-      font-size: 12px;
-    }
-
-    .external-row input:focus {
-      outline: none;
-      border-color: #4CAF50;
-    }
-
-    .external-row button {
-      flex: 0 0 auto;
-    }
-
-    .external-panel .progress-container {
-      margin-top: 8px;
-    }
 
     /* Diagnostics log — all three contexts in one place */
     .log-panel {
@@ -299,11 +259,6 @@
       gap: 8px;
     }
 
-    .handoff-btn {
-      display: block;
-      margin-top: 8px;
-      width: 100%;
-    }
     
     .progress-container {
       background: #2d2d2d;
@@ -409,22 +364,6 @@
     <div class="log-body" id="logBody"></div>
   </div>
 
-  <div class="external-panel">
-    <div class="external-label">External downloader (requires local helper)</div>
-    <div class="external-row">
-      <input type="url" id="externalUrl" placeholder="Paste a video page URL…">
-      <button class="btn-primary" id="externalBtn">Fetch</button>
-    </div>
-    <div class="progress-container" id="externalProgress">
-      <div class="progress-bar"><div class="progress-fill" style="width: 0%"></div></div>
-      <div class="progress-text">
-        <span class="progress-status">Starting…</span>
-        <span class="progress-percent">0%</span>
-      </div>
-    </div>
-    <div class="status-message" id="externalStatus" style="display: none;"></div>
-  </div>
-  
   <div id="streamList" class="stream-list">
     <!-- Streams populated here -->
   </div>

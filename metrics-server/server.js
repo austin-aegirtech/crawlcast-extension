@@ -11,92 +11,12 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
-const crypto = require('crypto');
 
 const PORT = process.env.PORT || 8787;
 const HOST = process.env.HOST || '127.0.0.1';
 const DATA_FILE = path.join(__dirname, 'events.jsonl');
 const DASHBOARD_FILE = path.join(__dirname, 'dashboard.html');
-const USERS_FILE = path.join(__dirname, 'users.json');
-const SECRET_FILE = path.join(__dirname, 'session-secret.txt');
 const MAX_BODY_BYTES = 1024 * 1024; // 1 MB per request is plenty
-
-// ---------------------------------------------------------------------------
-// Auth (private test period)
-//
-// Gates the extension behind login for the initial small test group. Users
-// are managed with `node manage-users.js add/remove/list` (see that file) —
-// this server only ever reads users.json, never writes it. Passwords are
-// hashed with scrypt (Node's built-in crypto — no extra dependency).
-// ---------------------------------------------------------------------------
-
-function loadUsers() {
-  try {
-    return JSON.parse(fs.readFileSync(USERS_FILE, 'utf8'));
-  } catch {
-    return {}; // no users.json yet — every login fails closed, not open
-  }
-}
-
-function verifyPassword(password, salt, hash) {
-  const check = crypto.scryptSync(password, salt, 64).toString('hex');
-  const a = Buffer.from(check, 'hex');
-  const b = Buffer.from(hash, 'hex');
-  // Constant-time compare — a length mismatch alone would otherwise leak
-  // timing information about the stored hash.
-  return a.length === b.length && crypto.timingSafeEqual(a, b);
-}
-
-// Generated on first run, kept out of git (see metrics-server/.gitignore).
-// Losing/rotating this just invalidates existing sessions — testers log in
-// again, nothing else depends on it right now.
-function getSessionSecret() {
-  try {
-    return fs.readFileSync(SECRET_FILE, 'utf8').trim();
-  } catch {
-    const secret = crypto.randomBytes(32).toString('hex');
-    fs.writeFileSync(SECRET_FILE, secret + '\n', { mode: 0o600 });
-    return secret;
-  }
-}
-const SESSION_SECRET = getSessionSecret();
-
-/** Opaque, HMAC-signed token. Not currently re-verified by any endpoint —
- *  the extension only needs a successful login handshake once per browser
- *  session — but it's real and signed now in case that changes later
- *  (e.g. gating /collect the same way). */
-function issueToken(username) {
-  const payload = `${username}.${Date.now()}`;
-  const sig = crypto.createHmac('sha256', SESSION_SECRET).update(payload).digest('hex');
-  return Buffer.from(`${payload}.${sig}`).toString('base64');
-}
-
-// Small in-memory throttle against password guessing. Deliberately simple —
-// a handful of testers, not a public login form — so it doesn't survive a
-// restart and doesn't need a dependency.
-const loginAttempts = new Map(); // ip -> { count, resetAt }
-const LOGIN_WINDOW_MS = 15 * 60 * 1000;
-const LOGIN_MAX_ATTEMPTS = 5;
-
-function isRateLimited(key) {
-  const entry = loginAttempts.get(key);
-  if (!entry) return false;
-  if (Date.now() > entry.resetAt) { loginAttempts.delete(key); return false; }
-  return entry.count >= LOGIN_MAX_ATTEMPTS;
-}
-
-function recordLoginAttempt(key) {
-  const entry = loginAttempts.get(key);
-  if (!entry || Date.now() > entry.resetAt) {
-    loginAttempts.set(key, { count: 1, resetAt: Date.now() + LOGIN_WINDOW_MS });
-  } else {
-    entry.count++;
-  }
-}
-
-function clearLoginAttempts(key) {
-  loginAttempts.delete(key);
-}
 
 // ---------------------------------------------------------------- helpers
 
@@ -225,50 +145,6 @@ const server = http.createServer((req, res) => {
     setCors(res);
     res.writeHead(204);
     res.end();
-    return;
-  }
-
-  // POST /auth/login — test-group login gate for the extension
-  if (req.method === 'POST' && url.pathname === '/auth/login') {
-    const ip = req.socket.remoteAddress || 'unknown';
-    let body = '';
-    let size = 0;
-    req.on('data', (chunk) => {
-      size += chunk.length;
-      if (size > MAX_BODY_BYTES) { req.destroy(); return; }
-      body += chunk;
-    });
-    req.on('end', () => {
-      if (isRateLimited(ip)) {
-        json(res, 429, { ok: false, error: 'Too many attempts. Try again in a few minutes.' });
-        return;
-      }
-
-      let payload;
-      try {
-        payload = JSON.parse(body);
-      } catch {
-        json(res, 400, { ok: false, error: 'Invalid request' });
-        return;
-      }
-
-      const { username, password } = payload || {};
-      if (!username || !password) {
-        json(res, 400, { ok: false, error: 'Username and password are required' });
-        return;
-      }
-
-      const users = loadUsers();
-      const user = users[username];
-      if (!user || !verifyPassword(password, user.salt, user.hash)) {
-        recordLoginAttempt(ip);
-        json(res, 401, { ok: false, error: 'Invalid username or password' });
-        return;
-      }
-
-      clearLoginAttempts(ip);
-      json(res, 200, { ok: true, username, token: issueToken(username) });
-    });
     return;
   }
 

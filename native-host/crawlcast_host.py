@@ -1,35 +1,15 @@
 #!/usr/bin/env python3
-"""
-Crawlcast native messaging host.
+"""Crawlcast native messaging host for MP4 remux/repair operations.
 
-A thin, general-purpose pipe between the Chrome extension and an external
-downloader program that the USER has installed on their own machine.
-This script contains no site-specific logic: it takes a URL, hands it to
-the configured binary, and relays that binary's progress output back to
-the extension.
-
-Protocol (Chrome native messaging):
-    stdin/stdout, each message = 4-byte little-endian length + UTF-8 JSON.
-
-Messages in:   {"url": "...", "outdir": "optional/path"}
-               {"action": "remux", "path": "C:/.../video.mp4"}
-Messages out:  {"type": "progress", "percent": 12.3, "line": "..."}
-               {"type": "done", "filename": "..."}
-               {"type": "remuxed", "path": "...", "bytes": 123, "normalized": true}
-               {"type": "remuxSkipped", "message": "..."}
-               {"type": "error", "message": "..."}
+Protocol: Chrome native messaging over stdin/stdout using length-prefixed JSON.
 """
 
 import json
 import os
-import re
 import struct
 import subprocess
 import sys
 
-# The external program invoked for each request. Must already be installed
-# and on PATH (or given as an absolute path). Override with CRAWLCAST_DL_BIN.
-DOWNLOADER_BIN = os.environ.get("CRAWLCAST_DL_BIN", "yt-dlp")
 
 # Used to repair fragmented MP4s produced by the in-browser pipeline.
 # Optional: if absent, files are simply left as they are.
@@ -47,10 +27,6 @@ LOUDNORM_I = "-16"
 LOUDNORM_TP = "-1.5"
 LOUDNORM_LRA = "11"
 
-PROGRESS_RE = re.compile(r"\[download\]\s+([\d.]+)%")
-DEST_RE = re.compile(r"\[download\] Destination:\s*(.+)")
-MERGE_RE = re.compile(r'\[Merger\] Merging formats into "(.+)"')
-ALREADY_RE = re.compile(r"\[download\]\s+(.+) has already been downloaded")
 
 
 # ----------------------------------------------------------- wire protocol
@@ -75,135 +51,6 @@ def send_message(obj):
 
 # --------------------------------------------------------------- execution
 
-def run_download(url, outdir=None):
-    """Invoke the external downloader, streaming progress back as it runs."""
-    if not url or not isinstance(url, str) or not url.startswith(("http://", "https://")):
-        send_message({"type": "error", "message": "A valid http(s) URL is required"})
-        return
-
-    target_dir = outdir or os.path.join(os.path.expanduser("~"), "Downloads")
-
-    cmd = [
-        DOWNLOADER_BIN,
-        "--newline",             # one progress line per update, easier to parse
-        "--no-colors",
-        "--progress",
-        "--paths", target_dir,
-        url,
-    ]
-
-    # Don't flash a console window on Windows
-    creationflags = 0
-    if os.name == "nt":
-        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-
-    try:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            universal_newlines=True,
-            bufsize=1,
-            creationflags=creationflags,
-        )
-    except FileNotFoundError:
-        send_message({
-            "type": "error",
-            "message": f"'{DOWNLOADER_BIN}' not found on PATH. Install it or set CRAWLCAST_DL_BIN.",
-        })
-        return
-    except Exception as exc:  # noqa: BLE001 - surface anything to the UI
-        send_message({"type": "error", "message": f"Failed to start downloader: {exc}"})
-        return
-
-    filename = None
-    last_percent = -1.0
-    tail = []
-
-    for line in proc.stdout:
-        line = line.rstrip("\n")
-        tail.append(line)
-        del tail[:-10]  # keep only the last 10 lines for error reporting
-
-        dest = DEST_RE.search(line) or MERGE_RE.search(line) or ALREADY_RE.search(line)
-        if dest:
-            filename = os.path.basename(dest.group(1).strip())
-
-        match = PROGRESS_RE.search(line)
-        if match:
-            percent = float(match.group(1))
-            # Throttle: only report whole-percent changes
-            if percent - last_percent >= 1.0 or percent >= 100.0:
-                last_percent = percent
-                send_message({"type": "progress", "percent": percent, "line": line})
-
-    proc.wait()
-
-    if proc.returncode == 0:
-        send_message({"type": "done", "filename": filename or "download"})
-    else:
-        send_message({
-            "type": "error",
-            "message": f"Downloader exited with code {proc.returncode}: " + " | ".join(tail[-3:]),
-        })
-
-
-def has_audio_stream(path):
-    """True if ffprobe finds at least one audio stream in path."""
-    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
-    try:
-        out = subprocess.run(
-            [FFPROBE_BIN, "-v", "error", "-select_streams", "a",
-             "-show_entries", "stream=index", "-of", "csv=p=0", path],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            universal_newlines=True, creationflags=creationflags,
-        )
-        return bool(out.stdout.strip())
-    except (FileNotFoundError, OSError):
-        return False
-
-
-def measure_loudness(path):
-    """
-    Pass 1 of two-pass loudnorm: analyze path's audio against the LOUDNORM_*
-    targets and return the measured stats dict, or None on any failure
-    (missing ffmpeg, no audio, unparseable output) so callers can fall back
-    to an unnormalized remux rather than losing the file.
-
-    Deliberately does not pass "-v error" — loudnorm prints its JSON stats
-    at the info log level, which "-v error" would silently swallow along
-    with everything else.
-    """
-    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
-    cmd = [FFMPEG_BIN, "-nostdin", "-hide_banner", "-y",
-           "-i", path,
-           "-af", f"loudnorm=I={LOUDNORM_I}:TP={LOUDNORM_TP}:LRA={LOUDNORM_LRA}:print_format=json",
-           "-f", "null", "-"]
-    try:
-        proc = subprocess.run(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            universal_newlines=True, creationflags=creationflags,
-        )
-    except (FileNotFoundError, OSError):
-        return None
-
-    match = re.search(r'\{[^{}]*"input_i"[^{}]*\}', proc.stdout or "", re.DOTALL)
-    if not match:
-        return None
-    try:
-        return json.loads(match.group(0))
-    except json.JSONDecodeError:
-        return None
-
-
-def build_loudnorm_filter(stats):
-    """Second-pass loudnorm filter string, fed pass 1's measured values."""
-    return (
-        f"loudnorm=I={LOUDNORM_I}:TP={LOUDNORM_TP}:LRA={LOUDNORM_LRA}"
-        f":measured_I={stats['input_i']}:measured_TP={stats['input_tp']}"
-        f":measured_LRA={stats['input_lra']}:measured_thresh={stats['input_thresh']}"
-        f":offset={stats['target_offset']}:linear=true:print_format=summary"
-    )
 
 
 def run_remux(path, audio_path=None):
@@ -375,7 +222,7 @@ def main():
         if message.get("action") == "remux":
             run_remux(message.get("path"), message.get("audioPath"))
         else:
-            run_download(message.get("url"), message.get("outdir"))
+            send_message({"type": "error", "message": "Unsupported native-host action"})
 
 
 if __name__ == "__main__":
