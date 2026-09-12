@@ -1,4 +1,2 @@
-# Created locally by manage-users.js / server.js — never commit credentials
-# or the session-signing secret.
-users.json
-session-secret.txt
+# Runtime telemetry data — generated locally, not source code.
+events.jsonl

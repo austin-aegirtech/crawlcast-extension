@@ -70,27 +70,3 @@ Privacy: only an anonymous install UUID plus the metrics above — no stream
 URLs, no page URLs, no personal data. If you ever publish the extension,
 disclose this collection in a privacy policy (Chrome Web Store requirement).
 
-## Login gate (private test period)
-
-The extension won't detect streams or start downloads until the popup's
-login form succeeds against `POST /auth/login` on this same server. See
-`auth.js` in the extension root for the client side.
-
-**Managing testers** — this server never writes `users.json` itself, only
-reads it. Add/remove/list accounts with:
-
-```bash
-node manage-users.js add alice      # prompts for a password, hides input
-node manage-users.js remove alice
-node manage-users.js list
-```
-
-Passwords are hashed with scrypt (Node's built-in `crypto`, no dependency)
-before they touch disk. `users.json` and the auto-generated
-`session-secret.txt` (used to sign login tokens) are both gitignored — never
-commit them.
-
-A lightweight in-memory rate limit (5 attempts / 15 min per IP) guards
-against password guessing. It resets on server restart — fine for a small
-test group, not meant to be a real production defense.
-

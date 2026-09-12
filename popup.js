@@ -27,10 +27,6 @@ function initAppHandlers() {
     loadLogs();
   });
 
-  document.getElementById('externalBtn').addEventListener('click', startExternalDownload);
-  document.getElementById('externalUrl').addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') startExternalDownload();
-  });
   
   // Listen for background messages
   chrome.runtime.onMessage.addListener((message) => {
@@ -44,15 +40,6 @@ function initAppHandlers() {
     }
     if (message.action === 'downloadError') {
       onDownloadError(message.url, message.error, message.tooLarge);
-    }
-    if (message.action === 'externalProgress') {
-      updateExternalProgress(message.percent, message.line);
-    }
-    if (message.action === 'externalComplete') {
-      finishExternal(true, `✅ Saved: ${message.filename}`);
-    }
-    if (message.action === 'externalError') {
-      finishExternal(false, `❌ ${message.error}`);
     }
     if (message.action === 'audioWarning') {
       setStatus(message.url, 'status-warn', '🔇 ' + message.message);
@@ -338,17 +325,6 @@ function onDownloadError(url, error, tooLarge) {
     statusEl.className = 'status-message status-error';
     statusEl.textContent = `❌ ${error}`;
 
-    // Too big for memory — offer one-click handoff to the external downloader
-    if (tooLarge) {
-      const handoff = document.createElement('button');
-      handoff.className = 'btn-secondary handoff-btn';
-      handoff.textContent = '↪ Send to external downloader';
-      handoff.addEventListener('click', () => {
-        document.getElementById('externalUrl').value = url;
-        startExternalDownload();
-      });
-      statusEl.appendChild(handoff);
-    }
   }
 
   // Re-render so the Cancel button disappears and Download re-enables
@@ -404,47 +380,6 @@ function copyLogs() {
   setTimeout(() => (btn.textContent = 'Copy all'), 1500);
 }
 
-// --------------------------------------------------------- external bridge
-
-function startExternalDownload() {
-  const input = document.getElementById('externalUrl');
-  const url = input.value.trim();
-  if (!url) return;
-
-  const btn = document.getElementById('externalBtn');
-  btn.disabled = true;
-  btn.textContent = '⏳';
-
-  const container = document.getElementById('externalProgress');
-  container.classList.add('active');
-  container.querySelector('.progress-fill').style.width = '0%';
-  container.querySelector('.progress-status').textContent = 'Starting…';
-  container.querySelector('.progress-percent').textContent = '0%';
-  document.getElementById('externalStatus').style.display = 'none';
-
-  chrome.runtime.sendMessage({ action: 'startExternalDownload', url }).catch(() => {});
-}
-
-function updateExternalProgress(percent, line) {
-  const container = document.getElementById('externalProgress');
-  container.classList.add('active');
-  container.querySelector('.progress-fill').style.width = `${percent}%`;
-  container.querySelector('.progress-percent').textContent = `${percent.toFixed(1)}%`;
-  container.querySelector('.progress-status').textContent = 'Downloading…';
-}
-
-function finishExternal(ok, text) {
-  const btn = document.getElementById('externalBtn');
-  btn.disabled = false;
-  btn.textContent = 'Fetch';
-
-  document.getElementById('externalProgress').classList.remove('active');
-
-  const status = document.getElementById('externalStatus');
-  status.style.display = 'block';
-  status.className = 'status-message ' + (ok ? 'status-success' : 'status-error');
-  status.textContent = text;
-}
 
 async function clearStreams() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -455,8 +390,7 @@ async function clearStreams() {
   loadStreams();
 }
 
-// In-browser downloads buffer everything in memory; above this the popup
-// steers you to the external downloader. Keep in sync with
+// In-browser downloads buffer everything in memory. Keep in sync with
 // VideoDownloader.memoryLimitBytes in downloader.js.
 const MEMORY_LIMIT_BYTES = 1.5e9;
 
@@ -477,7 +411,7 @@ function renderSize(meta) {
 
   let html = parts.join('');
   if (meta.bytes && meta.bytes > MEMORY_LIMIT_BYTES) {
-    html += '<div class="size-hint">⚠️ Too large for in-browser download — use the external downloader</div>';
+    html += '<div class="size-hint">⚠️ Too large for in-browser download</div>';
   }
   return html;
 }
