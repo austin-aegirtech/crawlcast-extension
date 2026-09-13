@@ -362,10 +362,18 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         result: { filename: request.filename }
       }).catch(() => {});
 
-      // Small files can finish before we registered them — check state now
+      // Small files can finish before we registered them — check state now.
+      // If completion was missed by onChanged, run the same remux path here
+      // before releasing the Blob URL.
       const [item] = await chrome.downloads.search({ id: downloadId });
       if (item && (item.state === 'complete' || item.state === 'interrupted')) {
+        const entry = pendingBlobUrls.get(downloadId);
         releaseBlobUrl(downloadId);
+
+        if (item.state === 'complete' && entry) {
+          remuxDownloadedFile(downloadId, entry.streamUrl).catch((e) =>
+            console.log('[Remux] Skipped:', e.message));
+        }
       }
     }).catch((err) => {
       activeDownloads.delete(request.streamUrl);

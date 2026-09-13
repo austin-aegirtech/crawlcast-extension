@@ -6,10 +6,10 @@ Protocol: Chrome native messaging over stdin/stdout using length-prefixed JSON.
 
 import json
 import os
+import re
 import struct
 import subprocess
 import sys
-
 
 # Used to repair fragmented MP4s produced by the in-browser pipeline.
 # Optional: if absent, files are simply left as they are.
@@ -51,6 +51,62 @@ def send_message(obj):
 
 # --------------------------------------------------------------- execution
 
+def has_audio_stream(path):
+    """True if ffprobe finds at least one audio stream in path."""
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+    try:
+        out = subprocess.run(
+            [FFPROBE_BIN, "-v", "error", "-select_streams", "a",
+             "-show_entries", "stream=index", "-of", "csv=p=0", path],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            universal_newlines=True, creationflags=creationflags,
+        )
+        return bool(out.stdout.strip())
+    except (FileNotFoundError, OSError):
+        return False
+
+
+def measure_loudness(path):
+    """
+    Pass 1 of two-pass loudnorm: analyze path's audio against the LOUDNORM_*
+    targets and return the measured stats dict, or None on any failure
+    (missing ffmpeg, no audio, unparseable output) so callers can fall back
+    to an unnormalized remux rather than losing the file.
+
+    Deliberately does not pass "-v error" — loudnorm prints its JSON stats
+    at the info log level, which "-v error" would silently swallow along
+    with everything else.
+    """
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+    cmd = [FFMPEG_BIN, "-nostdin", "-hide_banner", "-y",
+           "-i", path,
+           "-af", f"loudnorm=I={LOUDNORM_I}:TP={LOUDNORM_TP}:LRA={LOUDNORM_LRA}:print_format=json",
+           "-f", "null", "-"]
+    try:
+        proc = subprocess.run(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            universal_newlines=True, creationflags=creationflags,
+        )
+    except (FileNotFoundError, OSError):
+        return None
+
+    match = re.search(r'\{[^{}]*"input_i"[^{}]*\}', proc.stdout or "", re.DOTALL)
+    if not match:
+        return None
+    try:
+        return json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return None
+
+
+def build_loudnorm_filter(stats):
+    """Second-pass loudnorm filter string, fed pass 1's measured values."""
+    return (
+        f"loudnorm=I={LOUDNORM_I}:TP={LOUDNORM_TP}:LRA={LOUDNORM_LRA}"
+        f":measured_I={stats['input_i']}:measured_TP={stats['input_tp']}"
+        f":measured_LRA={stats['input_lra']}:measured_thresh={stats['input_thresh']}"
+        f":offset={stats['target_offset']}:linear=true:print_format=summary"
+    )
 
 
 def run_remux(path, audio_path=None):
