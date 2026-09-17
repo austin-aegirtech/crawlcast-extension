@@ -1,5 +1,6 @@
 // Track active downloads and their UI state
 const activeDownloadsUI = new Map();
+const completedDownloadsUI = new Set();
 
 // Hover-animation frames per stream url (populated from getStreams / thumbnailReady)
 const thumbFrames = new Map();
@@ -22,8 +23,10 @@ function initAppHandlers() {
   document.getElementById('refreshBtn').addEventListener('click', loadStreams);
   document.getElementById('clearBtn').addEventListener('click', clearStreams);
   document.getElementById('premiumBtn').addEventListener('click', showPremiumComingSoon);
+  document.getElementById('premiumClose').addEventListener('click', closePremium);
 
   document.getElementById('logsBtn').addEventListener('click', toggleLogs);
+  document.getElementById('logClose').addEventListener('click', () => setLogsOpen(false));
   document.getElementById('logRefresh').addEventListener('click', loadLogs);
   document.getElementById('logCopy').addEventListener('click', copyLogs);
   document.getElementById('logClear').addEventListener('click', async () => {
@@ -49,17 +52,20 @@ function initAppHandlers() {
       setStatus(message.url, 'status-warn', '🔇 ' + message.message);
     }
     if (message.action === 'remuxStarted') {
+      setDownloadStage(message.url, 'Repairing MP4 file…', 100);
       setStatus(message.url, 'status-success', message.merging
-        ? '🔊 Merging audio track and repairing MP4 index…'
-        : '🔧 Repairing MP4 index (making it seekable)…');
+        ? '🔊 Merging audio track and repairing MP4 file…'
+        : '🔧 Repairing MP4 file…');
     }
     if (message.action === 'remuxComplete') {
+      markDownloadComplete(message.url);
       setStatus(message.url, 'status-success', message.merged
-        ? '✅ Saved with audio merged — seeks properly now'
-        : '✅ Saved and repaired — seeks properly now');
+        ? '✅ Complete — audio merged and MP4 repaired'
+        : '✅ Complete — MP4 saved and repaired');
     }
     if (message.action === 'remuxSkipped') {
       // Not an error: the file downloaded fine, it just wasn't defragmented
+      markRepairSkipped(message.url);
       setStatus(message.url, 'status-warn',
         '⚠️ Saved, but not repaired (ffmpeg/native host unavailable). ' +
         'Playback may start slowly and seeking may be limited.');
@@ -142,7 +148,8 @@ function renderStreams(streams, tabId, pageTitle = currentPageTitle) {
   }
 
   listEl.innerHTML = streams.map((stream) => {
-    const isDownloading = activeDownloadsUI.has(stream.url) || stream.downloading;
+    const isComplete = completedDownloadsUI.has(stream.url);
+    const isDownloading = !isComplete && (activeDownloadsUI.has(stream.url) || stream.downloading);
     const hash = hashCode(stream.url);
     const displayTitle = getStreamTitle(stream, pageTitle);
     const duration = stream.meta?.durationSeconds
@@ -193,28 +200,29 @@ function renderStreams(streams, tabId, pageTitle = currentPageTitle) {
             </a>
 
             <div class="card-actions">
-              ${isDownloading ? `<button class="cancel-btn" data-url="${escapeHtml(stream.url)}" type="button">Cancel</button>` : ''}
+              ${isDownloading ? `<button class="cancel-btn" id="cancel-${hash}" data-url="${escapeHtml(stream.url)}" type="button">Cancel</button>` : ''}
               <button
                 class="download-btn"
+                id="download-${hash}"
                 data-url="${escapeHtml(stream.url)}"
                 data-tab="${tabId}"
                 type="button"
-                ${isDownloading ? 'disabled' : ''}
+                ${isDownloading || isComplete ? 'disabled' : ''}
               >
-                <span class="download-icon">↓</span>
-                <span>${isDownloading ? 'Downloading…' : 'Download'}</span>
+                <span class="download-icon">${isComplete ? '✓' : '↓'}</span>
+                <span>${isComplete ? 'Complete!' : (isDownloading ? 'Downloading…' : 'Download')}</span>
               </button>
             </div>
           </div>
         </div>
 
-        <div class="progress-container ${isDownloading ? 'active' : ''}" id="progress-${hash}">
+        <div class="progress-container ${isDownloading || isComplete ? 'active' : ''}" id="progress-${hash}">
           <div class="progress-bar">
-            <div class="progress-fill" style="width: 0%"></div>
+            <div class="progress-fill" style="width: ${isComplete ? '100%' : '0%'}"></div>
           </div>
           <div class="progress-text">
-            <span class="progress-status">Initializing...</span>
-            <span class="progress-percent">0%</span>
+            <span class="progress-status">${isComplete ? 'Complete' : 'Initializing...'}</span>
+            <span class="progress-percent">${isComplete ? '100%' : '0%'}</span>
           </div>
         </div>
 
@@ -268,6 +276,7 @@ async function startDownload(url, tabId) {
   const filename = buildDownloadFilename(currentPageTitle);
 
   // Update UI state
+  completedDownloadsUI.delete(url);
   activeDownloadsUI.set(url, { startTime: Date.now() });
   
   // Re-render to show progress UI
@@ -328,19 +337,55 @@ function setStatus(url, className, text) {
 }
 
 function onDownloadComplete(url, result) {
-  activeDownloadsUI.delete(url);
-  
+  // chrome.downloads has accepted the file, but Crawlcast may still need to
+  // repair the MP4. Keep the card in its active state until remuxComplete.
+  setDownloadStage(url, 'Saving MP4 file…', 100);
+  setStatus(url, 'status-success', `💾 Saved ${result.filename} — finishing MP4 processing…`);
+}
+
+function setDownloadStage(url, label, percentValue) {
   const hash = hashCode(url);
-  const statusEl = document.getElementById(`status-${hash}`);
-  
-  if (statusEl) {
-    statusEl.style.display = 'block';
-    statusEl.className = 'status-message status-success';
-    statusEl.textContent = `✅ Download complete: ${result.filename}`;
+  const container = document.getElementById(`progress-${hash}`);
+  if (!container) return;
+
+  container.classList.add('active');
+  const status = container.querySelector('.progress-status');
+  const percent = container.querySelector('.progress-percent');
+  const fill = container.querySelector('.progress-fill');
+
+  if (status) status.textContent = label;
+  if (typeof percentValue === 'number') {
+    if (fill) fill.style.width = `${percentValue}%`;
+    if (percent) percent.textContent = `${percentValue}%`;
   }
-  
-  // Re-enable button
-  const btn = document.querySelector(`button[data-url="${CSS.escape(url)}"]`);
+}
+
+function markDownloadComplete(url) {
+  activeDownloadsUI.delete(url);
+  completedDownloadsUI.add(url);
+  setDownloadStage(url, 'Complete', 100);
+
+  const hash = hashCode(url);
+  const cancel = document.getElementById(`cancel-${hash}`);
+  if (cancel) cancel.remove();
+
+  const btn = document.getElementById(`download-${hash}`);
+  if (btn) {
+    btn.disabled = true;
+    btn.innerHTML = '<span class="download-icon">✓</span><span>Complete!</span>';
+  }
+}
+
+function markRepairSkipped(url) {
+  activeDownloadsUI.delete(url);
+  completedDownloadsUI.delete(url);
+  setDownloadStage(url, 'Saved — repair skipped', 100);
+
+  const hash = hashCode(url);
+  const cancel = document.getElementById(`cancel-${hash}`);
+  if (cancel) cancel.remove();
+
+  const btn = document.getElementById(`download-${hash}`);
   if (btn) {
     btn.disabled = false;
     btn.innerHTML = '<span class="download-icon">↓</span><span>Download</span>';
@@ -349,6 +394,7 @@ function onDownloadComplete(url, result) {
 
 function onDownloadError(url, error, tooLarge) {
   activeDownloadsUI.delete(url);
+  completedDownloadsUI.delete(url);
 
   const hash = hashCode(url);
   const statusEl = document.getElementById(`status-${hash}`);
@@ -370,7 +416,11 @@ let logsOpen = false;
 let logCache = [];
 
 function toggleLogs() {
-  logsOpen = !logsOpen;
+  setLogsOpen(!logsOpen);
+}
+
+function setLogsOpen(open) {
+  logsOpen = open;
   document.getElementById('logPanel').classList.toggle('open', logsOpen);
   document.getElementById('logsBtn').classList.toggle('active', logsOpen);
   document.getElementById('logsBtnLabel').textContent = logsOpen ? 'Hide logs' : 'Logs';
@@ -422,6 +472,10 @@ async function clearStreams() {
     tabId: tab.id 
   });
   loadStreams();
+}
+
+function closePremium() {
+  document.getElementById('premiumCard').hidden = true;
 }
 
 function showPremiumComingSoon() {

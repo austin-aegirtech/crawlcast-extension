@@ -148,12 +148,35 @@
     }
 
     .premium-card {
-      padding: 18px 20px 16px;
+      position: relative;
+      padding: 18px 52px 16px 20px;
       margin-bottom: 18px;
       background: linear-gradient(180deg, #1b1c20 0%, #202126 100%);
       border: 1px solid #3d3e44;
       border-radius: 12px;
       box-shadow: 0 8px 24px rgba(0, 0, 0, 0.16);
+    }
+
+    .premium-close {
+      position: absolute;
+      top: 11px;
+      right: 11px;
+      width: 30px;
+      height: 30px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 7px;
+      color: #8f9198;
+      background: transparent;
+      font-size: 20px;
+      line-height: 1;
+      transition: color 0.18s ease, background 0.18s ease;
+    }
+
+    .premium-close:hover {
+      color: var(--text);
+      background: #2b2c31;
     }
 
     .premium-heading {
@@ -620,26 +643,40 @@
 
     .log-panel {
       display: none;
-      margin-top: 14px;
+      position: fixed;
+      z-index: 100;
+      top: 78px;
+      right: 28px;
+      bottom: 78px;
+      left: 28px;
       overflow: hidden;
+      flex-direction: column;
       background: #17181c;
-      border: 1px solid #393a40;
-      border-radius: 10px;
+      border: 1px solid #4a4b52;
+      border-radius: 12px;
+      box-shadow: 0 18px 50px rgba(0, 0, 0, 0.55);
     }
 
     .log-panel.open {
-      display: block;
+      display: flex;
     }
 
     .log-toolbar {
-      min-height: 42px;
-      padding: 7px 10px;
+      min-height: 46px;
+      padding: 7px 10px 7px 13px;
       display: flex;
       align-items: center;
       gap: 7px;
       color: var(--muted);
+      background: #202126;
       border-bottom: 1px solid #303137;
       font-size: 10px;
+    }
+
+    .log-title {
+      color: var(--text);
+      font-size: 12px;
+      font-weight: 700;
     }
 
     .log-toolbar .spacer {
@@ -660,7 +697,8 @@
     }
 
     .log-body {
-      max-height: 240px;
+      flex: 1;
+      min-height: 0;
       overflow-y: auto;
       padding: 6px 0;
       font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
@@ -801,7 +839,7 @@
         <img src="icons/icon48.png" class="brand-icon" alt="">
         <div class="brand-copy">
           <div class="brand-title">Crawlcast</div>
-          <div class="brand-subtitle">Stream. Capture. Download.</div>
+          <div class="brand-subtitle">Stream capture &amp; download</div>
         </div>
       </div>
       <div class="stream-count-pill">
@@ -811,7 +849,8 @@
     </header>
 
     <main class="content">
-      <section class="premium-card" aria-labelledby="premiumTitle">
+      <section class="premium-card" id="premiumCard" aria-labelledby="premiumTitle">
+        <button class="premium-close" id="premiumClose" type="button" aria-label="Close premium section" title="Close">×</button>
         <div class="premium-heading" id="premiumTitle">
           <span class="premium-gem">💎</span>
           <span>Get Premium</span>
@@ -843,11 +882,13 @@
 
       <div class="log-panel" id="logPanel">
         <div class="log-toolbar">
+          <strong class="log-title">Diagnostic logs</strong>
           <span id="logCount">0 entries</span>
           <div class="spacer"></div>
           <button type="button" id="logRefresh">Refresh</button>
           <button type="button" id="logCopy">Copy all</button>
           <button type="button" id="logClear">Clear</button>
+          <button type="button" id="logClose" aria-label="Close logs" title="Close logs">×</button>
         </div>
         <div class="log-body" id="logBody"></div>
       </div>
