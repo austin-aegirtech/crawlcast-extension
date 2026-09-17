@@ -4,6 +4,9 @@ const activeDownloadsUI = new Map();
 // Hover-animation frames per stream url (populated from getStreams / thumbnailReady)
 const thumbFrames = new Map();
 
+// Current page title is used for card labels and download filenames.
+let currentPageTitle = '';
+
 // Initialize
 document.addEventListener('DOMContentLoaded', () => {
   initAppHandlers();
@@ -18,6 +21,7 @@ function initAppHandlers() {
 
   document.getElementById('refreshBtn').addEventListener('click', loadStreams);
   document.getElementById('clearBtn').addEventListener('click', clearStreams);
+  document.getElementById('premiumBtn').addEventListener('click', showPremiumComingSoon);
 
   document.getElementById('logsBtn').addEventListener('click', toggleLogs);
   document.getElementById('logRefresh').addEventListener('click', loadLogs);
@@ -61,9 +65,10 @@ function initAppHandlers() {
         'Playback may start slowly and seeking may be limited.');
     }
     if (message.action === 'streamMeta') {
-      // Size arrives before the thumbnail — patch it in without a re-render
+      // Metadata arrives independently of the thumbnail — patch it in without a re-render.
       const el = document.getElementById(`size-${hashCode(message.url)}`);
       if (el) el.innerHTML = renderSize(message.meta);
+      updateDurationBadge(message.url, message.meta);
     }
     if (message.action === 'thumbnailReady' && message.thumbnail) {
       // Swap the placeholder for the freshly generated thumbnail in place
@@ -85,12 +90,14 @@ function initAppHandlers() {
 
 async function loadStreams() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  currentPageTitle = tab.title || '';
+
   const response = await chrome.runtime.sendMessage({
     action: 'getStreams',
     tabId: tab.id
   });
 
-  renderStreams(response.streams || [], tab.id);
+  renderStreams(response.streams || [], tab.id, currentPageTitle);
 
   // Lazily request thumbnails for streams that don't have one cached yet
   const missing = (response.streams || [])
@@ -105,92 +112,117 @@ async function loadStreams() {
   }
 }
 
-function renderStreams(streams, tabId) {
-  console.log('streams :::', streams);
+function renderStreams(streams, tabId, pageTitle = currentPageTitle) {
   const listEl = document.getElementById('streamList');
   const countEl = document.getElementById('streamCount');
-  
+  const toolbarStatus = document.getElementById('toolbarStatus');
+  const sectionSummary = document.getElementById('streamSectionSummary');
+
   countEl.textContent = streams.length;
-  
+  toolbarStatus.textContent = streams.length === 0
+    ? 'Ready — no streams detected'
+    : `Ready — ${streams.length} stream${streams.length === 1 ? '' : 's'} detected`;
+  sectionSummary.textContent = streams.length === 0
+    ? 'Waiting for video…'
+    : `${streams.length} available`;
+
   if (streams.length === 0) {
     listEl.innerHTML = `
       <div class="empty-state">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
           <rect x="2" y="2" width="20" height="20" rx="5"/>
           <circle cx="12" cy="12" r="4"/>
           <path d="M12 8v8M8 12h8"/>
         </svg>
-        <div>No M3U8 streams detected</div>
-        <div style="margin-top: 8px; font-size: 12px; opacity: 0.7;">
-          Play a video on this page to detect streams
-        </div>
+        <strong>No M3U8 streams detected</strong>
+        <span>Play a video on this page, then refresh if needed.</span>
       </div>
     `;
     return;
   }
-  
-  listEl.innerHTML = streams.map((stream, index) => {
+
+  listEl.innerHTML = streams.map((stream) => {
     const isDownloading = activeDownloadsUI.has(stream.url) || stream.downloading;
-    
+    const hash = hashCode(stream.url);
+    const displayTitle = getStreamTitle(stream, pageTitle);
+    const duration = stream.meta?.durationSeconds
+      ? formatDurationCompact(stream.meta.durationSeconds)
+      : '';
+
     if (stream.frames && stream.frames.length > 1) {
       thumbFrames.set(stream.url, stream.frames);
     }
 
     const thumb = stream.thumbnail
       ? `<img class="stream-thumb" src="${stream.thumbnail}" data-url="${escapeHtml(stream.url)}" alt="">`
-      : `<div class="stream-thumb stream-thumb-placeholder" id="thumb-${hashCode(stream.url)}">🎬</div>`;
+      : `<div class="stream-thumb stream-thumb-placeholder" id="thumb-${hash}">🎬</div>`;
+
+    const requestType = formatRequestType(stream.type);
 
     return `
-      <div class="stream-item" data-url="${escapeHtml(stream.url)}">
+      <article class="stream-item" data-url="${escapeHtml(stream.url)}">
         <div class="stream-row">
-          ${thumb}
+          <div class="stream-thumb-wrap">
+            ${thumb}
+            <div class="duration-badge ${duration ? 'visible' : ''}" id="duration-${hash}">
+              <span class="duration-play">▶</span>
+              <span class="duration-value">${duration}</span>
+            </div>
+          </div>
+
           <div class="stream-body">
-            <div class="stream-header">
-              <a class="stream-url" href="${escapeHtml(stream.url)}" target="_blank" rel="noopener noreferrer" title="${escapeHtml(stream.url)}">${escapeHtml(truncateUrl(stream.url, 70))}</a>
-              ${stream.type === 'xmlhttprequest' ? '<span class="quality-badge">XHR</span>' : ''}
+            <div class="title-row">
+              <div class="badges">
+                <span class="format-badge">M3U8</span>
+                ${requestType ? `<span class="request-badge">${escapeHtml(requestType)}</span>` : ''}
+              </div>
+              <div class="stream-title" title="${escapeHtml(displayTitle)}">${escapeHtml(displayTitle)}</div>
             </div>
 
             <div class="stream-meta">
-              <span>⏱️ ${formatTime(stream.timestamp)}</span>
-              <span>🌐 ${new URL(stream.url).hostname}</span>
+              <span class="meta-chip">${escapeHtml(getHostname(stream.url))}</span>
+              <span class="meta-chip">Detected ${formatTime(stream.timestamp)}</span>
             </div>
 
-            <div class="stream-size" id="size-${hashCode(stream.url)}">
+            <div class="stream-size" id="size-${hash}">
               ${renderSize(stream.meta)}
             </div>
+
+            <a class="stream-url" href="${escapeHtml(stream.url)}" target="_blank" rel="noopener noreferrer" title="${escapeHtml(stream.url)}">
+              ${escapeHtml(stream.url)}
+            </a>
+
+            <div class="card-actions">
+              ${isDownloading ? `<button class="cancel-btn" data-url="${escapeHtml(stream.url)}" type="button">Cancel</button>` : ''}
+              <button
+                class="download-btn"
+                data-url="${escapeHtml(stream.url)}"
+                data-tab="${tabId}"
+                type="button"
+                ${isDownloading ? 'disabled' : ''}
+              >
+                <span class="download-icon">↓</span>
+                <span>${isDownloading ? 'Downloading…' : 'Download'}</span>
+              </button>
+            </div>
           </div>
         </div>
 
-        <div class="download-section">
-          <div class="btn-row">
-            <button
-              class="btn-primary download-btn"
-              data-url="${escapeHtml(stream.url)}"
-              data-tab="${tabId}"
-              ${isDownloading ? 'disabled' : ''}
-            >
-              ${isDownloading ? '⏳ Downloading...' : '⬇️ Download as MP4'}
-            </button>
-            ${isDownloading ? `<button class="btn-danger cancel-btn" data-url="${escapeHtml(stream.url)}">✕ Cancel</button>` : ''}
+        <div class="progress-container ${isDownloading ? 'active' : ''}" id="progress-${hash}">
+          <div class="progress-bar">
+            <div class="progress-fill" style="width: 0%"></div>
           </div>
-
-          <div class="progress-container ${isDownloading ? 'active' : ''}" id="progress-${hashCode(stream.url)}">
-            <div class="progress-bar">
-              <div class="progress-fill" style="width: 0%"></div>
-            </div>
-            <div class="progress-text">
-              <span class="progress-status">Initializing...</span>
-              <span class="progress-percent">0%</span>
-            </div>
+          <div class="progress-text">
+            <span class="progress-status">Initializing...</span>
+            <span class="progress-percent">0%</span>
           </div>
-          
-          <div class="status-message" id="status-${hashCode(stream.url)}" style="display: none;"></div>
         </div>
-      </div>
+
+        <div class="status-message" id="status-${hash}" style="display: none;"></div>
+      </article>
     `;
   }).join('');
-  
-  // Attach handlers
+
   document.querySelectorAll('.download-btn').forEach(btn => {
     btn.addEventListener('click', () => startDownload(btn.dataset.url, btn.dataset.tab));
   });
@@ -231,18 +263,19 @@ function attachThumbHover(img) {
 }
 
 async function startDownload(url, tabId) {
-  const filename = `video_${Date.now()}.mp4`;
-  
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  currentPageTitle = tab?.title || currentPageTitle;
+  const filename = buildDownloadFilename(currentPageTitle);
+
   // Update UI state
   activeDownloadsUI.set(url, { startTime: Date.now() });
   
   // Re-render to show progress UI
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   const response = await chrome.runtime.sendMessage({ 
     action: 'getStreams', 
     tabId: tab.id 
   });
-  renderStreams(response.streams || [], tab.id);
+  renderStreams(response.streams || [], tab.id, currentPageTitle);
   
   // Start download in background
   await chrome.runtime.sendMessage({
@@ -310,7 +343,7 @@ function onDownloadComplete(url, result) {
   const btn = document.querySelector(`button[data-url="${CSS.escape(url)}"]`);
   if (btn) {
     btn.disabled = false;
-    btn.textContent = '⬇️ Download as MP4';
+    btn.innerHTML = '<span class="download-icon">↓</span><span>Download</span>';
   }
 }
 
@@ -339,7 +372,8 @@ let logCache = [];
 function toggleLogs() {
   logsOpen = !logsOpen;
   document.getElementById('logPanel').classList.toggle('open', logsOpen);
-  document.getElementById('logsBtn').textContent = logsOpen ? '📋 Hide logs' : '📋 Logs';
+  document.getElementById('logsBtn').classList.toggle('active', logsOpen);
+  document.getElementById('logsBtnLabel').textContent = logsOpen ? 'Hide logs' : 'Logs';
   if (logsOpen) loadLogs();
 }
 
@@ -390,6 +424,69 @@ async function clearStreams() {
   loadStreams();
 }
 
+function showPremiumComingSoon() {
+  const status = document.getElementById('premiumStatus');
+  const button = document.getElementById('premiumBtn');
+  status.classList.add('visible');
+  button.querySelector('span:last-child').textContent = 'Coming soon';
+}
+
+function updateDurationBadge(url, meta) {
+  const badge = document.getElementById(`duration-${hashCode(url)}`);
+  if (!badge) return;
+
+  const value = badge.querySelector('.duration-value');
+  if (meta?.durationSeconds) {
+    value.textContent = formatDurationCompact(meta.durationSeconds);
+    badge.classList.add('visible');
+  } else {
+    badge.classList.remove('visible');
+  }
+}
+
+function getStreamTitle(stream, pageTitle) {
+  const title = (stream?.title || pageTitle || '').trim();
+  return title || 'Detected HLS stream';
+}
+
+function formatRequestType(type) {
+  if (!type) return '';
+  if (type === 'xmlhttprequest') return 'XHR';
+  return type;
+}
+
+function getHostname(url) {
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return 'Unknown host';
+  }
+}
+
+function buildDownloadFilename(title) {
+  let base = (title || '').trim();
+
+  // Avoid duplicate extensions when a page title already ends in a video extension.
+  base = base.replace(/\.(mp4|m4v|mov|mkv|webm)$/i, '');
+
+  // Windows-invalid filename characters plus ASCII control characters.
+  base = base
+    .replace(/[<>:"/\\|?*\x00-\x1F]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .replace(/[. ]+$/g, '')
+    .trim();
+
+  if (!base) return `video_${Date.now()}.mp4`;
+
+  if (/^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i.test(base)) {
+    base = `video_${base}`;
+  }
+
+  // Leave room for the extension and keep the filename comfortably below OS path limits.
+  base = base.slice(0, 180).replace(/[. ]+$/g, '').trim();
+  return base ? `${base}.mp4` : `video_${Date.now()}.mp4`;
+}
+
 // In-browser downloads buffer everything in memory. Keep in sync with
 // VideoDownloader.memoryLimitBytes in downloader.js.
 const MEMORY_LIMIT_BYTES = 1.5e9;
@@ -427,6 +524,16 @@ function formatDuration(seconds) {
   const m = Math.floor((seconds % 3600) / 60);
   const s = Math.floor(seconds % 60);
   return h > 0 ? `${h}h ${m}m` : `${m}m ${s}s`;
+}
+
+function formatDurationCompact(seconds) {
+  const total = Math.max(0, Math.floor(seconds));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  return h > 0
+    ? `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
+    : `${m}:${String(s).padStart(2, '0')}`;
 }
 
 // Utility functions
