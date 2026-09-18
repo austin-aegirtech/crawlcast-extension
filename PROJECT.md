@@ -308,7 +308,7 @@ Current `manifest.json`:
   "manifest_version": 3,
   "name": "Crawlcast",
   "version": "0.1.0",
-  "description": "Detect and download HLS streams and direct MP4 video from the web.",
+  "description": "Detect and download HLS streams and direct MP4 video from the web",
   "permissions": [
     "webRequest",
     "storage",
