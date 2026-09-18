@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Crawlcast",
-  "version": "1.0.0",
-  "description": "Crawling..",
+  "version": "0.1.0",
+  "description": "Detect and download HLS streams and direct MP4 video from the web.",
   "permissions": [
     "webRequest",
     "storage",
@@ -12,7 +12,8 @@
     "nativeMessaging"
   ],
   "host_permissions": [
-    "<all_urls>"
+    "http://*/*",
+    "https://*/*"
   ],
   "background": {
     "service_worker": "background.js"
