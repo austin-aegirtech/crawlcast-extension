@@ -23,7 +23,7 @@ class VideoDownloader {
     // Fetch concurrency: how many segment downloads run in parallel.
     // Safe because only *fetching* is parallel — segments are pushed
     // through the shared transmuxer and written strictly in order.
-    this.concurrency = 2;
+    this.concurrency = 2; // Reduced from 4 to 2 because we were seeing a lot of 503's from the download server
 
     // Segment retries share a cooldown so a temporary CDN/server failure
     // does not cause the rest of the fetch window to keep hammering it.
