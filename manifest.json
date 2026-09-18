@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Crawlcast",
-  "version": "1.0.0",
-  "description": "Crawling..",
+  "version": "0.0.0",
+  "description": "Crawlcast is a Manifest V3 browser extension that watches the active page for HLS (`.m3u8`) streams, previews what it finds, downloads the stream segments, and assembles them into MP4 output directly from the browser",
   "permissions": [
     "webRequest",
     "storage",
