@@ -333,16 +333,14 @@ function renderStreams(streams, tabId, pageTitle = currentPageTitle) {
         </div>
 
         <div class="progress-container ${isDownloading || isComplete ? 'active' : ''}" id="progress-${hash}">
-          <div class="progress-bar">
-            <div class="progress-fill" style="width: ${isComplete ? '100%' : '0%'}"></div>
-          </div>
+          <progress class="progress-bar" max="100" value="${isComplete ? '100' : '0'}" aria-label="Download progress"></progress>
           <div class="progress-text">
             <span class="progress-status">${isComplete ? 'Complete' : 'Initializing...'}</span>
             <span class="progress-percent">${isComplete ? '100%' : '0%'}</span>
           </div>
         </div>
 
-        <div class="status-message" id="status-${hash}" style="display: none;"></div>
+        <div class="status-message" id="status-${hash}" hidden></div>
       </article>
     `;
   }).join('');
@@ -430,13 +428,13 @@ async function startDownload(url, tabId) {
 function updateDownloadProgress(url, progress) {
   const hash = hashCode(url);
   const container = document.getElementById(`progress-${hash}`);
-  const fill = container?.querySelector('.progress-fill');
+  const progressBar = container?.querySelector('.progress-bar');
   const status = container?.querySelector('.progress-status');
   const percent = container?.querySelector('.progress-percent');
 
-  if (container && fill) {
+  if (container && progressBar) {
     container.classList.add('active');
-    fill.style.width = `${progress.percent}%`;
+    progressBar.value = progress.percent;
 
     if (status) {
       if (progress.phase === 'finalizing') {
@@ -463,7 +461,7 @@ function cancelDownload(url) {
 function setStatus(url, className, text) {
   const el = document.getElementById(`status-${hashCode(url)}`);
   if (!el) return;
-  el.style.display = 'block';
+  el.hidden = false;
   el.className = `status-message ${className}`;
   el.textContent = text;
 }
@@ -483,11 +481,11 @@ function setDownloadStage(url, label, percentValue) {
   container.classList.add('active');
   const status = container.querySelector('.progress-status');
   const percent = container.querySelector('.progress-percent');
-  const fill = container.querySelector('.progress-fill');
+  const progressBar = container.querySelector('.progress-bar');
 
   if (status) status.textContent = label;
   if (typeof percentValue === 'number') {
-    if (fill) fill.style.width = `${percentValue}%`;
+    if (progressBar) progressBar.value = percentValue;
     if (percent) percent.textContent = `${percentValue}%`;
   }
 }
@@ -534,7 +532,7 @@ function onDownloadError(url, error, tooLarge) {
   const statusEl = document.getElementById(`status-${hash}`);
 
   if (statusEl) {
-    statusEl.style.display = 'block';
+    statusEl.hidden = false;
     statusEl.className = 'status-message status-error';
     statusEl.textContent = `❌ ${error}`;
 
