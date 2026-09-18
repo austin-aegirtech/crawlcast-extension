@@ -1,9 +1,13 @@
 # Crawlcast — Project Architecture & Developer Reference
 
-> **Repository snapshot documented:** `main` @ `9f7be54`  
-> **Manifest version:** `1.0.0`  
+> **Repository snapshot:** uploaded `check.zip`  
+> **Git branch:** `main`  
+> **Git commit:** `10fcfa3da78eb46890c74a27d62b338c745440c2` (`10fcfa3`)  
+> **Worktree at inspection time:** clean  
+> **Chrome manifest schema:** Manifest V3 (`"manifest_version": 3`)  
+> **Extension package version:** `0.1.0` (`"version": "0.1.0"`)  
 > **Document regenerated:** 2026-09-18  
-> **Purpose:** authoritative technical reference for the current Crawlcast codebase.
+> **Purpose:** authoritative technical reference for this exact Crawlcast repository snapshot.
 
 Crawlcast is a Chrome Manifest V3 browser extension that detects downloadable video requests made by the active page and handles two media paths:
 
@@ -303,8 +307,8 @@ Current `manifest.json`:
 {
   "manifest_version": 3,
   "name": "Crawlcast",
-  "version": "1.0.0",
-  "description": "Crawling..",
+  "version": "0.1.0",
+  "description": "Detect and download HLS streams and direct MP4 video from the web.",
   "permissions": [
     "webRequest",
     "storage",
@@ -314,8 +318,25 @@ Current `manifest.json`:
     "nativeMessaging"
   ],
   "host_permissions": [
-    "<all_urls>"
-  ]
+    "http://*/*",
+    "https://*/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
 }
 ```
 
@@ -329,16 +350,16 @@ Current `manifest.json`:
 | `downloads` | Save direct MP4 files and HLS-generated Blob URLs; monitor download completion/cancellation. |
 | `offscreen` | Run DOM-capable HLS/media work unavailable to a service worker. |
 | `nativeMessaging` | Talk to the local MP4 inspection/repair host. |
-| `<all_urls>` | Detect media and fetch playlists/segments from arbitrary web origins. |
+| `http://*/*`, `https://*/*` | Detect media and fetch playlists/segments from arbitrary web origins over normal web protocols. |
 
-### Release note
+### Current manifest note
 
-The actual uploaded snapshot still contains:
+This snapshot already uses a customer-facing description and limits host permissions to normal HTTP/HTTPS origins:
 
-- `"description": "Crawling.."`
-- `"host_permissions": ["<all_urls>"]`
+- `"description": "Detect and download HLS streams and direct MP4 video from the web."`
+- `"host_permissions": ["http://*/*", "https://*/*"]`
 
-Those are the current code facts, even though a narrower `http://*/*` + `https://*/*` permission set and a production description have already been discussed for store readiness.
+The `webRequest` listener itself still uses `{ urls: ["<all_urls>"] }` as its filter, but Chrome's manifest host permissions bound which web origins the extension can actually observe.
 
 ---
 
