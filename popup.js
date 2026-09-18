@@ -298,7 +298,24 @@ function renderStreams(streams, tabId, pageTitle = currentPageTitle) {
                 <span class="format-badge">M3U8</span>
                 ${requestType ? `<span class="request-badge">${escapeHtml(requestType)}</span>` : ''}
               </div>
-              <div class="stream-title" title="${escapeHtml(displayTitle)}">${escapeHtml(displayTitle)}</div>
+              <div
+                class="stream-title ${isDownloading || isComplete ? 'title-locked' : ''}"
+                id="title-${hash}"
+                data-url="${escapeHtml(stream.url)}"
+                data-fallback-title="${escapeHtml(pageTitle || '')}"
+                title="${escapeHtml(displayTitle)}"
+              >
+                <span class="stream-title-text">${escapeHtml(displayTitle)}</span>
+                ${isDownloading || isComplete ? '' : `
+                  <button
+                    class="title-edit-btn"
+                    type="button"
+                    data-url="${escapeHtml(stream.url)}"
+                    aria-label="Edit title"
+                    title="Edit title"
+                  >✎</button>
+                `}
+              </div>
             </div>
 
             <div class="stream-meta">
@@ -353,7 +370,131 @@ function renderStreams(streams, tabId, pageTitle = currentPageTitle) {
     btn.addEventListener('click', () => cancelDownload(btn.dataset.url));
   });
 
+  document.querySelectorAll('.stream-title:not(.title-locked)').forEach(titleEl => {
+    titleEl.addEventListener('click', (event) => {
+      if (event.target.closest('.title-edit-btn')) return;
+      beginTitleEdit(titleEl.dataset.url);
+    });
+  });
+
+  document.querySelectorAll('.title-edit-btn').forEach(btn => {
+    btn.addEventListener('click', (event) => {
+      event.stopPropagation();
+      beginTitleEdit(btn.dataset.url);
+    });
+  });
+
   document.querySelectorAll('img.stream-thumb').forEach(attachThumbHover);
+}
+
+function beginTitleEdit(url) {
+  const titleEl = document.getElementById(`title-${hashCode(url)}`);
+  if (!titleEl || titleEl.classList.contains('title-locked') || titleEl.querySelector('.stream-title-input')) {
+    return;
+  }
+
+  const textEl = titleEl.querySelector('.stream-title-text');
+  const originalTitle = textEl?.textContent?.trim() || '';
+  const fallbackTitle = titleEl.dataset.fallbackTitle || currentPageTitle || '';
+
+  const input = document.createElement('input');
+  input.className = 'stream-title-input';
+  input.type = 'text';
+  input.value = originalTitle;
+  input.maxLength = 240;
+  input.setAttribute('aria-label', 'Download title');
+
+  titleEl.classList.add('editing');
+  titleEl.replaceChildren(input);
+  input.focus();
+  input.select();
+
+  let finished = false;
+
+  const finish = async (save) => {
+    if (finished) return;
+    finished = true;
+
+    const requestedTitle = save ? input.value.trim() : originalTitle;
+    let displayTitle = requestedTitle || fallbackTitle.trim() || 'Detected HLS stream';
+
+    if (save) {
+      const response = await chrome.runtime.sendMessage({
+        action: 'setStreamTitle',
+        url,
+        title: requestedTitle
+      }).catch(() => null);
+
+      if (!response?.success) {
+        displayTitle = originalTitle || fallbackTitle.trim() || 'Detected HLS stream';
+        setStatus(url, 'status-error', '❌ Could not save title');
+      }
+    }
+
+    titleEl.classList.remove('editing');
+    titleEl.title = displayTitle;
+
+    const span = document.createElement('span');
+    span.className = 'stream-title-text';
+    span.textContent = displayTitle;
+
+    const button = document.createElement('button');
+    button.className = 'title-edit-btn';
+    button.type = 'button';
+    button.dataset.url = url;
+    button.setAttribute('aria-label', 'Edit title');
+    button.title = 'Edit title';
+    button.textContent = '✎';
+    button.addEventListener('click', (event) => {
+      event.stopPropagation();
+      beginTitleEdit(url);
+    });
+
+    titleEl.replaceChildren(span, button);
+  };
+
+  input.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      input.blur();
+    } else if (event.key === 'Escape') {
+      event.preventDefault();
+      finished = true;
+      titleEl.classList.remove('editing');
+      titleEl.title = originalTitle;
+
+      const span = document.createElement('span');
+      span.className = 'stream-title-text';
+      span.textContent = originalTitle;
+
+      const button = document.createElement('button');
+      button.className = 'title-edit-btn';
+      button.type = 'button';
+      button.dataset.url = url;
+      button.setAttribute('aria-label', 'Edit title');
+      button.title = 'Edit title';
+      button.textContent = '✎';
+      button.addEventListener('click', (clickEvent) => {
+        clickEvent.stopPropagation();
+        beginTitleEdit(url);
+      });
+
+      titleEl.replaceChildren(span, button);
+    }
+  });
+
+  input.addEventListener('blur', () => {
+    finish(true);
+  }, { once: true });
+}
+
+function getCardTitle(url) {
+  const titleEl = document.getElementById(`title-${hashCode(url)}`);
+  const input = titleEl?.querySelector('.stream-title-input');
+  if (input) return input.value.trim();
+
+  const text = titleEl?.querySelector('.stream-title-text')?.textContent?.trim();
+  return text || currentPageTitle;
 }
 
 /**
@@ -387,7 +528,7 @@ function attachThumbHover(img) {
 async function startDownload(url, tabId) {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   currentPageTitle = tab?.title || currentPageTitle;
-  const filename = buildDownloadFilename(currentPageTitle);
+  const filename = buildDownloadFilename(getCardTitle(url));
 
   // Ask the background worker first. User Mode is enforced there so popup
   // closes/reopens cannot reset or bypass the rolling-hour limit.

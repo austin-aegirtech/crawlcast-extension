@@ -311,6 +311,24 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     });
   }
 
+  // Persist a user-edited title on the detected stream so it survives
+  // popup closes for as long as the stream remains in session storage.
+  if (request.action === 'setStreamTitle') {
+    streamsRestored.then(() => {
+      const stream = detectedStreams.get(request.url);
+      if (!stream) {
+        sendResponse({ success: false, error: 'Stream not found' });
+        return;
+      }
+
+      const title = typeof request.title === 'string' ? request.title.trim() : '';
+      stream.title = title || null;
+      persistStreams();
+      sendResponse({ success: true, title: stream.title });
+    });
+    return true;
+  }
+
   // Clear streams
   if (request.action === 'clearStreams') {
     console.log('clear streams');
