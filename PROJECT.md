@@ -1,7 +1,7 @@
 # Miteruno — Technical Documentation
 
-> **Running document.** Update the [Change Log](#14-change-log) whenever behaviour
-> changes, and keep [Known Limitations](#12-known-limitations--trade-offs) honest.
+> **Running document.** Update the [Change Log](#13-change-log) whenever behaviour
+> changes, and keep [Known Limitations](#11-known-limitations--trade-offs) honest.
 > Last updated: 2026-08-04 · Extension version 1.0.0 (Himitsu)
 
 ---
@@ -17,12 +17,11 @@
 7. [MP4 Container Internals](#7-mp4-container-internals)
 8. [Thumbnails & Previews](#8-thumbnails--previews)
 9. [The Native Host](#9-the-native-host)
-10. [Telemetry & Metrics Dashboard](#10-telemetry--metrics-dashboard)
-11. [Message Protocol Reference](#11-message-protocol-reference)
-12. [Known Limitations & Trade-offs](#12-known-limitations--trade-offs)
-13. [Testing Notes](#13-testing-notes)
-14. [Change Log](#14-change-log)
-15. [Future Work](#15-future-work)
+10. [Message Protocol Reference](#10-message-protocol-reference)
+11. [Known Limitations & Trade-offs](#11-known-limitations--trade-offs)
+12. [Testing Notes](#12-testing-notes)
+14. [Change Log](#13-change-log)
+14. [Future Work](#14-future-work)
 
 ---
 
@@ -47,9 +46,6 @@ The extension does five distinct jobs:
 | Download + transmux segments into an MP4 | Offscreen document |
 | Repair the saved file so it seeks properly | Native messaging host |
 | Hand large/unsupported videos to an external tool | Native messaging host |
-
-A sixth, optional component — a self-hosted metrics collector and dashboard —
-tracks usage across installs.
 
 Only the first three are self-contained. The native host requires a one-time
 local install; without it, downloads still work but stay fragmented.
@@ -153,7 +149,6 @@ Line counts as of v1.0.0 (Himitsu).
 | `offscreen.html` | 12 | Loads mux.js, parser, downloader, glue |
 | `downloader.js` | 476 | `VideoDownloader` — fetch, transmux, assemble |
 | `m3u8-parser.js` | 196 | `M3U8Parser` — playlist parsing |
-| `telemetry.js` | 73 | Anonymous event batching |
 | `lib/mux.min.js` | — | mux.js 7.1.0 (TS→MP4 transmuxer) |
 
 
@@ -166,8 +161,6 @@ Line counts as of v1.0.0 (Himitsu).
 | `native-host/com.miteruno.downloader.json` | 9 | Native host manifest |
 | `tools/remux.sh` | 252 | Batch-repair existing files (bash) |
 | `tools/Repair-Videos.ps1` | 320 | Batch-repair + damage scan (PowerShell) |
-| `metrics-server/server.js` | 196 | Zero-dependency collector + API |
-| `metrics-server/dashboard.html` | 157 | Chart.js dashboard |
 | `PROJECT.md` | — | This document |
 
 ### Permissions and why each is needed
@@ -175,7 +168,7 @@ Line counts as of v1.0.0 (Himitsu).
 | Permission | Reason |
 |---|---|
 | `webRequest` | Observe network requests to spot `.m3u8` URLs |
-| `storage` | `storage.session` for streams; `storage.local` for install ID |
+| `storage` | `storage.session` for streams/logs; `storage.local` for mode/limit state |
 | `activeTab` | Resolve the current tab so streams are scoped per-tab |
 | `downloads` | Save the finished Blob to disk |
 | `offscreen` | Create the hidden document that hosts the pipeline |
@@ -604,52 +597,7 @@ those containers cannot hold an MP4 index.
 
 ---
 
-## 10. Telemetry & Metrics Dashboard
-
-Optional, self-hosted, zero-dependency.
-
-### Extension side (`telemetry.js`)
-
-An anonymous UUID is generated once and stored in `chrome.storage.local`. Events
-are queued in memory and flushed after 5 s of quiet or when 20 accumulate,
-whichever comes first. **All failures are swallowed** — telemetry must never
-disturb the extension.
-
-Events emitted: `extension_installed`, `stream_detected` (hostname only),
-`download_start`, `download_complete` (bytes, segments, failedSegments, ms),
-`download_error`, `thumbnail_generated`, `external_download_start` /
-`_complete` / `_error`, `remux_complete` (bytes), `remux_skipped`.
-
-The remux pair is worth watching in aggregate: a high `remux_skipped` ratio
-means most installs lack the native host, and are therefore getting fragmented
-files with slow startup.
-
-**Privacy:** no stream URLs, no page URLs, no personal data. Publishing the
-extension would require disclosing this collection in a privacy policy.
-
-### Server side (`metrics-server/`)
-
-`server.js` uses only Node built-ins. Events append to `events.jsonl` (one JSON
-object per line — append-only, crash-safe, trivially greppable). Aggregation
-happens on read with an mtime+size cache key, so repeated dashboard refreshes
-don't re-parse the file.
-
-| Route | Purpose |
-|---|---|
-| `POST /collect` | Ingest a batch |
-| `GET /api/stats` | Aggregated JSON |
-| `GET /` | Dashboard |
-
-`dashboard.html` renders cards (installs, downloads, bytes, error rate, average
-duration) and four Chart.js charts (daily active installs, stacked events/day,
-bytes/day, version split) plus a recent-events table. Auto-refreshes every 30 s.
-
-Deployment (nginx reverse proxy + systemd) is documented in
-`metrics-server/README.md`.
-
----
-
-## 11. Message Protocol Reference
+## 10. Message Protocol Reference
 
 ### Popup → Background
 
@@ -687,7 +635,7 @@ Deployment (nginx reverse proxy + systemd) is documented in
 
 | Action | Payload |
 |---|---|
-| `saveBlob` | `blobUrl`, `filename`, `streamUrl`, `stats` |
+| `saveBlob` | `blobUrl`, `filename`, `streamUrl` |
 | `downloadProgress` | `url`, `progress` |
 | `downloadError` | `url`, `error`, `tooLarge` |
 | `streamMeta` | `url`, `meta` |
@@ -712,7 +660,7 @@ Deployment (nginx reverse proxy + systemd) is documented in
 
 ---
 
-## 12. Known Limitations & Trade-offs
+## 11. Known Limitations & Trade-offs
 
 | Limitation | Cause | Mitigation |
 |---|---|---|
@@ -727,7 +675,7 @@ Deployment (nginx reverse proxy + systemd) is documented in
 
 ---
 
-## 13. Testing Notes
+## 12. Testing Notes
 
 No test framework is wired up; verification so far has been targeted harnesses
 run under Node with browser globals stubbed. Worth preserving as regression tests:
@@ -762,12 +710,9 @@ parentheses, a `.ts` needing extension promotion, a corrupt file, plus empty and
 missing directories. Assert skip-existing, `-f`, `-r` (and that it prunes its
 own `remuxed/` output), and that `-i` swaps atomically.
 
-**Metrics server** — POST sample batches, assert distinct-install counts,
-byte totals, error rate, and per-day bucketing.
-
 ---
 
-## 14. Change Log
+## 13. Change Log
 
 > Append new entries at the top. Note *why*, not just *what*.
 
@@ -781,9 +726,6 @@ behaviour — nothing was reverted, only renamed.
 - **Retries raised from 3 to 20**, still linear backoff (`1000ms × attempt`).
   A stalled/flaky segment now gets substantially more chances before the
   downloader gives up on it and moves on.
-- **Telemetry endpoint switched to local** (`http://127.0.0.1:8787/collect`),
-  `ployan.me` commented out in `telemetry.js`. Temporary — pending an account
-  password reset — not a change of collection intent.
 
 ---
 
@@ -839,7 +781,6 @@ behaviour — nothing was reverted, only renamed.
 - **Size guard.** Refuse in-browser downloads over 1.5 GB with a one-click
   handoff, instead of silently OOM-ing the offscreen document.
 - **External downloader bridge.** Native messaging host + popup panel.
-- **Telemetry + dashboard.** Anonymous batched events, self-hosted collector.
 - **Animated previews.** 8 frames spread across the whole video, 600 ms cycle
   on hover. (First cut sampled only the first segment — too narrow to read.)
 - **Download button state persisted.** `getStreams` now stamps `downloading`
@@ -861,7 +802,7 @@ behaviour — nothing was reverted, only renamed.
 
 ---
 
-## 15. Future Work
+## 14. Future Work
 
 **Defragment without external tools.** The native-host remux (v1.1.1) solves
 this whenever the host and ffmpeg are installed, but not otherwise. Two ways to

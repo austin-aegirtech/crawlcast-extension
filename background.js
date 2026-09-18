@@ -1,7 +1,5 @@
 // Download pipeline runs in offscreen.html (service workers have no DOM);
 // this worker only detects streams and brokers messages.
-importScripts('telemetry.js');
-
 // Store detected streams
 const detectedStreams = new Map();
 const activeDownloads = new Map();
@@ -108,14 +106,12 @@ async function remuxDownloadedFile(downloadId, streamUrl) {
 
   port.onMessage.addListener((msg) => {
     if (msg.type === 'remuxed') {
-      trackEvent('remux_complete', { bytes: msg.bytes || 0, merged: !!msg.merged });
       broadcast({
         action: 'remuxComplete', url: streamUrl, path: msg.path, merged: !!msg.merged
       });
       port.disconnect();
     } else if (msg.type === 'remuxSkipped' || msg.type === 'error') {
       console.log('[Remux] Skipped:', msg.message);
-      trackEvent('remux_skipped', {});
       broadcast({ action: 'remuxSkipped', url: streamUrl, message: msg.message });
       port.disconnect();
     }
@@ -242,7 +238,6 @@ chrome.webRequest.onBeforeRequest.addListener(
 
     persistStreams();
     updateBadge(details.tabId);
-    trackEvent('stream_detected', { host: new URL(url).hostname });
     console.log('[M3U8 Detector] Found:', url);
   },
   { urls: ["<all_urls>"] },
@@ -430,19 +425,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       url: request.blobUrl,
       filename: request.filename
     }).then(async (downloadId) => {
-      const info = activeDownloads.get(request.streamUrl);
       activeDownloads.delete(request.streamUrl);
       pendingBlobUrls.set(downloadId, {
         blobUrl: request.blobUrl,
         streamUrl: request.streamUrl
-      });
-
-      const stats = request.stats || {};
-      trackEvent('download_complete', {
-        bytes: stats.bytesDownloaded || 0,
-        segments: stats.downloaded || 0,
-        failedSegments: stats.failed || 0,
-        ms: info ? Date.now() - info.startTime : 0
       });
 
       chrome.runtime.sendMessage({
@@ -493,7 +479,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   // (the popup receives the same broadcast directly)
   if (request.action === 'downloadError') {
     activeDownloads.delete(request.url);
-    trackEvent('download_error', { message: String(request.error).slice(0, 200) });
     maybeCloseOffscreen();
   }
 
@@ -544,7 +529,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         if (request.frames) stream.frames = request.frames; // hover animation frames
         persistStreams();
       }
-      trackEvent('thumbnail_generated', { ok: !!request.thumbnail });
       maybeCloseOffscreen();
     });
   }
@@ -598,8 +582,6 @@ async function startDownload(url, filename, tabId) {
   });
 
   await ensureOffscreenDocument();
-  trackEvent('download_start');
-
   chrome.runtime.sendMessage({
     target: 'offscreen',
     action: 'downloadStream',

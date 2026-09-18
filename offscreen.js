@@ -297,7 +297,6 @@ function startDownload(url, filename) {
         blobUrl: blobUrl,
         filename: result.filename,
         streamUrl: url,
-        stats: result.stats, // forwarded to background for metrics
         audioBlobUrl,
         audioFilename,
         needsAudioMerge: !!result.needsAudioMerge,

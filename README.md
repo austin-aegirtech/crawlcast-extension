@@ -205,7 +205,6 @@ crawlcast-extension/
 ├── offscreen.js                  # Download orchestration and thumbnail generation
 ├── m3u8-parser.js                # HLS playlist parsing
 ├── downloader.js                 # Segment fetching, transmux orchestration, audio handling
-├── telemetry.js                  # Local-development telemetry client
 ├── lib/
 │   ├── mux.min.js                # HLS TS → MP4 transmuxing dependency
 │   └── StreamSaver.min.js        # Checked-in library file
@@ -215,10 +214,9 @@ crawlcast-extension/
 │   ├── crawlcast_host.bat        # Windows launcher
 │   ├── com.crawlcast.downloader.json
 │   └── register-native-host*.{ps1,sh}
-├── tools/
-│   ├── remux.sh                  # Standalone repair helper
-│   └── Repair-Videos.ps1         # Windows repair / scan helper
-└── metrics-server/               # Optional local metrics collector/dashboard
+└── tools/
+    ├── remux.sh                  # Standalone repair helper
+    └── Repair-Videos.ps1         # Windows repair / scan helper
 ```
 
 ### Reloading changes
@@ -255,11 +253,9 @@ Crawlcast currently requests the following extension permissions:
 
 ## Privacy
 
-The current development build contains lightweight telemetry code configured to send to a **local collector only** at `127.0.0.1:8787`.
+Crawlcast does not send usage telemetry, analytics events, stream URLs, or downloaded media to a Crawlcast metrics service.
 
-The telemetry client uses an anonymous per-install UUID and records extension events. Stream URLs are not transmitted by that client; stream-detection events include the serving hostname rather than the full media URL. If no local collector is running, telemetry failures are silently discarded and do not interrupt downloads.
-
-The media download pipeline itself fetches the stream directly from its source and processes it locally in the browser/native host rather than uploading the video to a Crawlcast processing service.
+The media download pipeline fetches the stream directly from its source and processes it locally in the browser/native host rather than uploading the video to a Crawlcast processing service.
 
 ## Current limitations
 
