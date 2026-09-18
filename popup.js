@@ -220,6 +220,7 @@ async function loadStreams() {
 
   // Lazily request thumbnails for streams that don't have one cached yet
   const missing = (response.streams || [])
+    .filter(s => getStreamFormat(s) !== 'mp4')
     .filter(s => (!s.thumbnail && !s.thumbnailTried) || (!s.meta && !s.metaTried))
     .map(s => s.url);
   if (missing.length > 0) {
@@ -253,7 +254,7 @@ function renderStreams(streams, tabId, pageTitle = currentPageTitle) {
           <circle cx="12" cy="12" r="4"/>
           <path d="M12 8v8M8 12h8"/>
         </svg>
-        <strong>No M3U8 streams detected</strong>
+        <strong>No video streams detected</strong>
         <span>Play a video on this page and Crawlcast will detect available streams.</span>
       </div>
     `;
@@ -279,6 +280,8 @@ function renderStreams(streams, tabId, pageTitle = currentPageTitle) {
       : `<div class="stream-thumb stream-thumb-placeholder" id="thumb-${hash}">🎬</div>`;
 
     const requestType = formatRequestType(stream.type);
+    const streamFormat = getStreamFormat(stream);
+    const formatLabel = streamFormat === 'mp4' ? 'MP4' : 'M3U8';
 
     return `
       <article class="stream-item" data-url="${escapeHtml(stream.url)}">
@@ -294,7 +297,7 @@ function renderStreams(streams, tabId, pageTitle = currentPageTitle) {
           <div class="stream-body">
             <div class="title-row">
               <div class="badges">
-                <span class="format-badge">M3U8</span>
+                <span class="format-badge">${formatLabel}</span>
                 ${requestType ? `<span class="request-badge">${escapeHtml(requestType)}</span>` : ''}
               </div>
               <div
@@ -323,7 +326,7 @@ function renderStreams(streams, tabId, pageTitle = currentPageTitle) {
             </div>
 
             <div class="stream-size" id="size-${hash}">
-              ${renderSize(stream.meta)}
+              ${renderSize(stream.meta, streamFormat)}
             </div>
 
             <a class="stream-url" href="${escapeHtml(stream.url)}" target="_blank" rel="noopener noreferrer" title="${escapeHtml(stream.url)}">
@@ -574,6 +577,24 @@ function updateDownloadProgress(url, progress) {
 
   if (container && progressBar) {
     container.classList.add('active');
+
+    if (progress.kind === 'direct') {
+      const received = Number(progress.bytesReceived) || 0;
+      const total = Number(progress.totalBytes) || 0;
+
+      if (total > 0) {
+        progressBar.value = progress.percent;
+        if (percent) percent.textContent = `${progress.percent}%`;
+        if (status) status.textContent = `Downloading: ${formatBytes(received)} / ${formatBytes(total)}`;
+      } else {
+        // Native <progress> becomes indeterminate without a value attribute.
+        progressBar.removeAttribute('value');
+        if (percent) percent.textContent = '';
+        if (status) status.textContent = `Downloading: ${formatBytes(received)}`;
+      }
+      return;
+    }
+
     progressBar.value = progress.percent;
 
     if (status) {
@@ -772,7 +793,14 @@ function updateDurationBadge(url, meta) {
 
 function getStreamTitle(stream, pageTitle) {
   const title = (stream?.title || pageTitle || '').trim();
-  return title || 'Detected HLS stream';
+  if (title) return title;
+  return getStreamFormat(stream) === 'mp4' ? 'Detected MP4 video' : 'Detected HLS stream';
+}
+
+function getStreamFormat(stream) {
+  if (stream?.format === 'mp4' || stream?.format === 'm3u8') return stream.format;
+  const url = stream?.url || '';
+  return /\.mp4(?:$|[?#])/i.test(url) ? 'mp4' : 'm3u8';
 }
 
 function formatRequestType(type) {
@@ -818,8 +846,12 @@ function buildDownloadFilename(title) {
 const MEMORY_LIMIT_BYTES = 1.5e9;
 
 /** Size / duration / quality line for a stream card */
-function renderSize(meta) {
-  if (!meta) return '<span class="size-pending">Analyzing…</span>';
+function renderSize(meta, format = 'm3u8') {
+  if (!meta) {
+    return format === 'mp4'
+      ? '<span class="size-pending">Direct MP4</span>'
+      : '<span class="size-pending">Analyzing…</span>';
+  }
 
   const parts = [];
   if (meta.bytes) {
@@ -830,7 +862,7 @@ function renderSize(meta) {
   }
   if (meta.durationSeconds) parts.push(`<span>🎞️ ${formatDuration(meta.durationSeconds)}</span>`);
   if (meta.resolution) parts.push(`<span>🖥️ ${escapeHtml(meta.resolution)}</span>`);
-  parts.push(`<span>${meta.segments} segments</span>`);
+  if (meta.segments) parts.push(`<span>${meta.segments} segments</span>`);
 
   let html = parts.join('');
   if (meta.bytes && meta.bytes > MEMORY_LIMIT_BYTES) {
