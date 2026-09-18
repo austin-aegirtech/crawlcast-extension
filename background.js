@@ -205,11 +205,18 @@ async function remuxDownloadedFile(downloadId, streamUrl) {
   const audio = pendingAudioMerge.get(streamUrl);
   pendingAudioMerge.delete(streamUrl);
 
+  // Direct MP4s are often already normal, faststart files. Inspect those
+  // first so a healthy file can finish immediately without an unnecessary
+  // full-file rewrite. HLS output still always gets remuxed because the
+  // browser pipeline emits fragmented MP4.
+  const stream = detectedStreams.get(streamUrl);
+  const inspectFirst = getStreamFormat(stream || streamUrl) === 'mp4' && !audio;
+
   let port;
   try {
     port = chrome.runtime.connectNative(NATIVE_HOST);
   } catch (e) {
-    console.log('[Remux] Native host unavailable — file left fragmented.');
+    console.log('[Remux] Native host unavailable — file left as-is.');
     if (audio) {
       broadcast({
         action: 'audioWarning',
@@ -222,19 +229,50 @@ async function remuxDownloadedFile(downloadId, streamUrl) {
     return;
   }
 
-  broadcast({
-    action: 'remuxStarted',
-    url: streamUrl,
-    merging: !!(audio && audio.audioPath)
-  });
+  let finished = false;
+  let remuxStarted = false;
+
+  const startRemux = () => {
+    if (finished || remuxStarted) return;
+    remuxStarted = true;
+    broadcast({
+      action: 'remuxStarted',
+      url: streamUrl,
+      merging: !!(audio && audio.audioPath)
+    });
+    port.postMessage(buildRemuxMessage(item.filename, audio));
+  };
 
   port.onMessage.addListener((msg) => {
+    if (msg.type === 'inspection') {
+      if (msg.needsRemux) {
+        startRemux();
+      } else {
+        finished = true;
+        broadcast({
+          action: 'remuxComplete',
+          url: streamUrl,
+          path: item.filename,
+          merged: false,
+          alreadyOptimized: true
+        });
+        port.disconnect();
+      }
+      return;
+    }
+
     if (msg.type === 'remuxed') {
+      finished = true;
       broadcast({
-        action: 'remuxComplete', url: streamUrl, path: msg.path, merged: !!msg.merged
+        action: 'remuxComplete',
+        url: streamUrl,
+        path: msg.path,
+        merged: !!msg.merged,
+        alreadyOptimized: false
       });
       port.disconnect();
     } else if (msg.type === 'remuxSkipped' || msg.type === 'error') {
+      finished = true;
       console.log('[Remux] Skipped:', msg.message);
       broadcast({ action: 'remuxSkipped', url: streamUrl, message: msg.message });
       port.disconnect();
@@ -243,13 +281,17 @@ async function remuxDownloadedFile(downloadId, streamUrl) {
 
   port.onDisconnect.addListener(() => {
     const err = chrome.runtime.lastError;
-    if (err) {
+    if (err && !finished) {
       console.log('[Remux] Host disconnected:', err.message);
       broadcast({ action: 'remuxSkipped', url: streamUrl, message: 'Native host not installed' });
     }
   });
 
-  port.postMessage(buildRemuxMessage(item.filename, audio));
+  if (inspectFirst) {
+    port.postMessage({ action: 'inspect', path: item.filename });
+  } else {
+    startRemux();
+  }
 }
 
 // Thumbnail generation jobs in flight (stream urls)
