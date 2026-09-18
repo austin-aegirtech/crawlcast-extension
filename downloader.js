@@ -147,7 +147,6 @@ class VideoDownloader {
 
       this.onComplete({
         filename,
-        stats: this.stats,
         blob,
         audioBlob,
         // Tells the pipeline the two streams still need merging

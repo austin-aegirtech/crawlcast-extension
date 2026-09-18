@@ -10,9 +10,7 @@
  * the browser fully closes, so testers sign in again each browser session —
  * that's the agreed design, not a bug.
  *
- * The backend is the same self-hosted server as telemetry.js's collector.
- * Keep AUTH_ENDPOINT in sync with TELEMETRY_ENDPOINT there by hand for now —
- * both point at 127.0.0.1:8787 while the ployan.me account is locked out.
+ * The authentication backend is currently stubbed for local development.
  */
 
 const AUTH_ENDPOINT = 'http://127.0.0.1:8787/auth/login';

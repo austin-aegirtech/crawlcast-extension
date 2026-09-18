@@ -8,9 +8,16 @@ const thumbFrames = new Map();
 // Current page title is used for card labels and download filenames.
 let currentPageTitle = '';
 
+// Free-tier mode state comes from background.js so closing the popup never
+// resets or bypasses the rolling download limit.
+let currentMode = 'user';
+let userModeNextAllowedAt = 0;
+let rateLimitCountdownTimer = null;
+
 // Initialize
 document.addEventListener('DOMContentLoaded', () => {
   initAppHandlers();
+  loadModeState();
   loadStreams();
 });
 
@@ -20,10 +27,10 @@ function initAppHandlers() {
   if (appHandlersInitialized) return;
   appHandlersInitialized = true;
 
-  document.getElementById('refreshBtn').addEventListener('click', loadStreams);
   document.getElementById('clearBtn').addEventListener('click', clearStreams);
   document.getElementById('premiumBtn').addEventListener('click', showPremiumComingSoon);
   document.getElementById('premiumClose').addEventListener('click', closePremium);
+  document.getElementById('modeToggle').addEventListener('click', toggleMode);
 
   document.getElementById('logsBtn').addEventListener('click', toggleLogs);
   document.getElementById('logClose').addEventListener('click', () => setLogsOpen(false));
@@ -94,6 +101,112 @@ function initAppHandlers() {
   });
 }
 
+async function loadModeState() {
+  const response = await chrome.runtime.sendMessage({ action: 'getModeState' }).catch(() => null);
+  if (response?.success) applyModeState(response);
+}
+
+async function toggleMode() {
+  const button = document.getElementById('modeToggle');
+  const nextMode = currentMode === 'user' ? 'god' : 'user';
+  button.disabled = true;
+
+  try {
+    const response = await chrome.runtime.sendMessage({
+      action: 'setMode',
+      mode: nextMode
+    });
+    if (response?.success) applyModeState(response);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function applyModeState(state) {
+  currentMode = state.mode === 'god' ? 'god' : 'user';
+  userModeNextAllowedAt = Number(state.nextAllowedAt) || 0;
+
+  const button = document.getElementById('modeToggle');
+  const label = document.getElementById('modeLabel');
+  const isGodMode = currentMode === 'god';
+
+  button.classList.toggle('god', isGodMode);
+  button.setAttribute('aria-pressed', String(isGodMode));
+  label.textContent = isGodMode ? 'God Mode' : 'User Mode';
+
+  if (isGodMode) {
+    button.title = 'God Mode — unlimited downloads';
+  } else {
+    updateUserModeTitle();
+  }
+
+  syncRateLimitUI();
+}
+
+function isUserModeRateLimited() {
+  return currentMode === 'user' && userModeNextAllowedAt > Date.now();
+}
+
+function updateUserModeTitle() {
+  const button = document.getElementById('modeToggle');
+  if (!button || currentMode !== 'user') return;
+
+  const remainingMs = Math.max(0, userModeNextAllowedAt - Date.now());
+  button.title = remainingMs > 0
+    ? `User Mode — next download available in ${formatRemainingTime(remainingMs)}`
+    : 'User Mode — 1 download per hour';
+}
+
+function syncRateLimitUI() {
+  if (rateLimitCountdownTimer) {
+    clearInterval(rateLimitCountdownTimer);
+    rateLimitCountdownTimer = null;
+  }
+
+  updateRateLimitCountdown();
+
+  if (!isUserModeRateLimited()) return;
+
+  rateLimitCountdownTimer = setInterval(() => {
+    updateRateLimitCountdown();
+  }, 1000);
+}
+
+function updateRateLimitCountdown() {
+  const indicator = document.getElementById('premiumLimitCountdown');
+  const value = document.getElementById('premiumCountdownValue');
+  if (!indicator || !value) return;
+
+  const remainingMs = Math.max(0, userModeNextAllowedAt - Date.now());
+  const limited = currentMode === 'user' && remainingMs > 0;
+
+  indicator.hidden = !limited;
+
+  document.querySelectorAll('.download-btn').forEach((button) => {
+    const isIdle = button.dataset.state === 'idle';
+    if (limited) {
+      if (isIdle) button.disabled = true;
+    } else if (isIdle) {
+      button.disabled = false;
+    }
+  });
+
+  if (!limited) {
+    if (rateLimitCountdownTimer) {
+      clearInterval(rateLimitCountdownTimer);
+      rateLimitCountdownTimer = null;
+    }
+    if (currentMode === 'user' && userModeNextAllowedAt > 0) {
+      userModeNextAllowedAt = 0;
+    }
+    updateUserModeTitle();
+    return;
+  }
+
+  value.textContent = formatCountdown(remainingMs);
+  updateUserModeTitle();
+}
+
 async function loadStreams() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   currentPageTitle = tab.title || '';
@@ -141,7 +254,7 @@ function renderStreams(streams, tabId, pageTitle = currentPageTitle) {
           <path d="M12 8v8M8 12h8"/>
         </svg>
         <strong>No M3U8 streams detected</strong>
-        <span>Play a video on this page, then refresh if needed.</span>
+        <span>Play a video on this page and Crawlcast will detect available streams.</span>
       </div>
     `;
     return;
@@ -150,6 +263,7 @@ function renderStreams(streams, tabId, pageTitle = currentPageTitle) {
   listEl.innerHTML = streams.map((stream) => {
     const isComplete = completedDownloadsUI.has(stream.url);
     const isDownloading = !isComplete && (activeDownloadsUI.has(stream.url) || stream.downloading);
+    const isRateLimited = isUserModeRateLimited();
     const hash = hashCode(stream.url);
     const displayTitle = getStreamTitle(stream, pageTitle);
     const duration = stream.meta?.durationSeconds
@@ -183,7 +297,24 @@ function renderStreams(streams, tabId, pageTitle = currentPageTitle) {
                 <span class="format-badge">M3U8</span>
                 ${requestType ? `<span class="request-badge">${escapeHtml(requestType)}</span>` : ''}
               </div>
-              <div class="stream-title" title="${escapeHtml(displayTitle)}">${escapeHtml(displayTitle)}</div>
+              <div
+                class="stream-title ${isDownloading || isComplete ? 'title-locked' : ''}"
+                id="title-${hash}"
+                data-url="${escapeHtml(stream.url)}"
+                data-fallback-title="${escapeHtml(pageTitle || '')}"
+                title="${escapeHtml(displayTitle)}"
+              >
+                <span class="stream-title-text">${escapeHtml(displayTitle)}</span>
+                ${isDownloading || isComplete ? '' : `
+                  <button
+                    class="title-edit-btn"
+                    type="button"
+                    data-url="${escapeHtml(stream.url)}"
+                    aria-label="Edit title"
+                    title="Edit title"
+                  >✎</button>
+                `}
+              </div>
             </div>
 
             <div class="stream-meta">
@@ -206,8 +337,9 @@ function renderStreams(streams, tabId, pageTitle = currentPageTitle) {
                 id="download-${hash}"
                 data-url="${escapeHtml(stream.url)}"
                 data-tab="${tabId}"
+                data-state="${isComplete ? 'complete' : (isDownloading ? 'downloading' : 'idle')}"
                 type="button"
-                ${isDownloading || isComplete ? 'disabled' : ''}
+                ${isDownloading || isComplete || isRateLimited ? 'disabled' : ''}
               >
                 <span class="download-icon">${isComplete ? '✓' : '↓'}</span>
                 <span>${isComplete ? 'Complete!' : (isDownloading ? 'Downloading…' : 'Download')}</span>
@@ -217,16 +349,14 @@ function renderStreams(streams, tabId, pageTitle = currentPageTitle) {
         </div>
 
         <div class="progress-container ${isDownloading || isComplete ? 'active' : ''}" id="progress-${hash}">
-          <div class="progress-bar">
-            <div class="progress-fill" style="width: ${isComplete ? '100%' : '0%'}"></div>
-          </div>
+          <progress class="progress-bar" max="100" value="${isComplete ? '100' : '0'}" aria-label="Download progress"></progress>
           <div class="progress-text">
             <span class="progress-status">${isComplete ? 'Complete' : 'Initializing...'}</span>
             <span class="progress-percent">${isComplete ? '100%' : '0%'}</span>
           </div>
         </div>
 
-        <div class="status-message" id="status-${hash}" style="display: none;"></div>
+        <div class="status-message" id="status-${hash}" hidden></div>
       </article>
     `;
   }).join('');
@@ -239,7 +369,131 @@ function renderStreams(streams, tabId, pageTitle = currentPageTitle) {
     btn.addEventListener('click', () => cancelDownload(btn.dataset.url));
   });
 
+  document.querySelectorAll('.stream-title:not(.title-locked)').forEach(titleEl => {
+    titleEl.addEventListener('click', (event) => {
+      if (event.target.closest('.title-edit-btn')) return;
+      beginTitleEdit(titleEl.dataset.url);
+    });
+  });
+
+  document.querySelectorAll('.title-edit-btn').forEach(btn => {
+    btn.addEventListener('click', (event) => {
+      event.stopPropagation();
+      beginTitleEdit(btn.dataset.url);
+    });
+  });
+
   document.querySelectorAll('img.stream-thumb').forEach(attachThumbHover);
+}
+
+function beginTitleEdit(url) {
+  const titleEl = document.getElementById(`title-${hashCode(url)}`);
+  if (!titleEl || titleEl.classList.contains('title-locked') || titleEl.querySelector('.stream-title-input')) {
+    return;
+  }
+
+  const textEl = titleEl.querySelector('.stream-title-text');
+  const originalTitle = textEl?.textContent?.trim() || '';
+  const fallbackTitle = titleEl.dataset.fallbackTitle || currentPageTitle || '';
+
+  const input = document.createElement('input');
+  input.className = 'stream-title-input';
+  input.type = 'text';
+  input.value = originalTitle;
+  input.maxLength = 240;
+  input.setAttribute('aria-label', 'Download title');
+
+  titleEl.classList.add('editing');
+  titleEl.replaceChildren(input);
+  input.focus();
+  input.select();
+
+  let finished = false;
+
+  const finish = async (save) => {
+    if (finished) return;
+    finished = true;
+
+    const requestedTitle = save ? input.value.trim() : originalTitle;
+    let displayTitle = requestedTitle || fallbackTitle.trim() || 'Detected HLS stream';
+
+    if (save) {
+      const response = await chrome.runtime.sendMessage({
+        action: 'setStreamTitle',
+        url,
+        title: requestedTitle
+      }).catch(() => null);
+
+      if (!response?.success) {
+        displayTitle = originalTitle || fallbackTitle.trim() || 'Detected HLS stream';
+        setStatus(url, 'status-error', '❌ Could not save title');
+      }
+    }
+
+    titleEl.classList.remove('editing');
+    titleEl.title = displayTitle;
+
+    const span = document.createElement('span');
+    span.className = 'stream-title-text';
+    span.textContent = displayTitle;
+
+    const button = document.createElement('button');
+    button.className = 'title-edit-btn';
+    button.type = 'button';
+    button.dataset.url = url;
+    button.setAttribute('aria-label', 'Edit title');
+    button.title = 'Edit title';
+    button.textContent = '✎';
+    button.addEventListener('click', (event) => {
+      event.stopPropagation();
+      beginTitleEdit(url);
+    });
+
+    titleEl.replaceChildren(span, button);
+  };
+
+  input.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      input.blur();
+    } else if (event.key === 'Escape') {
+      event.preventDefault();
+      finished = true;
+      titleEl.classList.remove('editing');
+      titleEl.title = originalTitle;
+
+      const span = document.createElement('span');
+      span.className = 'stream-title-text';
+      span.textContent = originalTitle;
+
+      const button = document.createElement('button');
+      button.className = 'title-edit-btn';
+      button.type = 'button';
+      button.dataset.url = url;
+      button.setAttribute('aria-label', 'Edit title');
+      button.title = 'Edit title';
+      button.textContent = '✎';
+      button.addEventListener('click', (clickEvent) => {
+        clickEvent.stopPropagation();
+        beginTitleEdit(url);
+      });
+
+      titleEl.replaceChildren(span, button);
+    }
+  });
+
+  input.addEventListener('blur', () => {
+    finish(true);
+  }, { once: true });
+}
+
+function getCardTitle(url) {
+  const titleEl = document.getElementById(`title-${hashCode(url)}`);
+  const input = titleEl?.querySelector('.stream-title-input');
+  if (input) return input.value.trim();
+
+  const text = titleEl?.querySelector('.stream-title-text')?.textContent?.trim();
+  return text || currentPageTitle;
 }
 
 /**
@@ -273,38 +527,54 @@ function attachThumbHover(img) {
 async function startDownload(url, tabId) {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   currentPageTitle = tab?.title || currentPageTitle;
-  const filename = buildDownloadFilename(currentPageTitle);
+  const filename = buildDownloadFilename(getCardTitle(url));
 
-  // Update UI state
-  completedDownloadsUI.delete(url);
-  activeDownloadsUI.set(url, { startTime: Date.now() });
-  
-  // Re-render to show progress UI
-  const response = await chrome.runtime.sendMessage({ 
-    action: 'getStreams', 
-    tabId: tab.id 
-  });
-  renderStreams(response.streams || [], tab.id, currentPageTitle);
-  
-  // Start download in background
-  await chrome.runtime.sendMessage({
+  // Ask the background worker first. User Mode is enforced there so popup
+  // closes/reopens cannot reset or bypass the rolling-hour limit.
+  const startResult = await chrome.runtime.sendMessage({
     action: 'startDownload',
     url: url,
     filename: filename,
     tabId: parseInt(tabId)
   });
+
+  if (startResult?.mode) applyModeState(startResult);
+
+  if (!startResult?.success) {
+    if (startResult?.reason === 'rate_limit') {
+      setStatus(
+        url,
+        'status-warn',
+        `⏱️ User Mode allows 1 download per hour. Try again in ${formatRemainingTime(startResult.remainingMs)}.`
+      );
+      return;
+    }
+
+    setStatus(url, 'status-error', `❌ ${startResult?.error || 'Could not start download'}`);
+    return;
+  }
+
+  completedDownloadsUI.delete(url);
+  activeDownloadsUI.set(url, { startTime: Date.now() });
+
+  // Re-render to show progress UI using the background worker's live state.
+  const response = await chrome.runtime.sendMessage({
+    action: 'getStreams',
+    tabId: tab.id
+  });
+  renderStreams(response.streams || [], tab.id, currentPageTitle);
 }
 
 function updateDownloadProgress(url, progress) {
   const hash = hashCode(url);
   const container = document.getElementById(`progress-${hash}`);
-  const fill = container?.querySelector('.progress-fill');
+  const progressBar = container?.querySelector('.progress-bar');
   const status = container?.querySelector('.progress-status');
   const percent = container?.querySelector('.progress-percent');
 
-  if (container && fill) {
+  if (container && progressBar) {
     container.classList.add('active');
-    fill.style.width = `${progress.percent}%`;
+    progressBar.value = progress.percent;
 
     if (status) {
       if (progress.phase === 'finalizing') {
@@ -331,7 +601,7 @@ function cancelDownload(url) {
 function setStatus(url, className, text) {
   const el = document.getElementById(`status-${hashCode(url)}`);
   if (!el) return;
-  el.style.display = 'block';
+  el.hidden = false;
   el.className = `status-message ${className}`;
   el.textContent = text;
 }
@@ -351,11 +621,11 @@ function setDownloadStage(url, label, percentValue) {
   container.classList.add('active');
   const status = container.querySelector('.progress-status');
   const percent = container.querySelector('.progress-percent');
-  const fill = container.querySelector('.progress-fill');
+  const progressBar = container.querySelector('.progress-bar');
 
   if (status) status.textContent = label;
   if (typeof percentValue === 'number') {
-    if (fill) fill.style.width = `${percentValue}%`;
+    if (progressBar) progressBar.value = percentValue;
     if (percent) percent.textContent = `${percentValue}%`;
   }
 }
@@ -371,6 +641,7 @@ function markDownloadComplete(url) {
 
   const btn = document.getElementById(`download-${hash}`);
   if (btn) {
+    btn.dataset.state = 'complete';
     btn.disabled = true;
     btn.innerHTML = '<span class="download-icon">✓</span><span>Complete!</span>';
   }
@@ -387,7 +658,8 @@ function markRepairSkipped(url) {
 
   const btn = document.getElementById(`download-${hash}`);
   if (btn) {
-    btn.disabled = false;
+    btn.dataset.state = 'idle';
+    btn.disabled = isUserModeRateLimited();
     btn.innerHTML = '<span class="download-icon">↓</span><span>Download</span>';
   }
 }
@@ -400,7 +672,7 @@ function onDownloadError(url, error, tooLarge) {
   const statusEl = document.getElementById(`status-${hash}`);
 
   if (statusEl) {
-    statusEl.style.display = 'block';
+    statusEl.hidden = false;
     statusEl.className = 'status-message status-error';
     statusEl.textContent = `❌ ${error}`;
 
@@ -588,6 +860,24 @@ function formatDurationCompact(seconds) {
   return h > 0
     ? `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
     : `${m}:${String(s).padStart(2, '0')}`;
+}
+
+function formatRemainingTime(ms) {
+  const totalSeconds = Math.max(1, Math.ceil((Number(ms) || 0) / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+
+  if (minutes >= 1) {
+    return `${minutes}m ${String(seconds).padStart(2, '0')}s`;
+  }
+  return `${seconds}s`;
+}
+
+function formatCountdown(ms) {
+  const totalSeconds = Math.max(0, Math.ceil((Number(ms) || 0) / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
 }
 
 // Utility functions

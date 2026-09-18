@@ -1,7 +1,5 @@
 // Download pipeline runs in offscreen.html (service workers have no DOM);
 // this worker only detects streams and brokers messages.
-importScripts('telemetry.js');
-
 // Store detected streams
 const detectedStreams = new Map();
 const activeDownloads = new Map();
@@ -10,6 +8,36 @@ const activeDownloads = new Map();
 // Once finished we tell the offscreen doc to revoke them — otherwise every
 // downloaded video stays in memory for the life of the offscreen document.
 const pendingBlobUrls = new Map();
+
+// Free-tier mode state. User Mode allows one accepted download start per
+// rolling 60-minute window; God Mode bypasses the limit. Keep this in
+// storage.local so the limit survives popup closes and browser restarts.
+const USER_MODE_DOWNLOAD_LIMIT_MS = 60 * 60 * 1000;
+let crawlcastMode = 'user';
+let userModeLastDownloadAt = 0;
+
+const modeStateRestored = chrome.storage.local
+  .get(['crawlcastMode', 'userModeLastDownloadAt'])
+  .then((data) => {
+    crawlcastMode = data.crawlcastMode === 'god' ? 'god' : 'user';
+    userModeLastDownloadAt = Number(data.userModeLastDownloadAt) || 0;
+  });
+
+function getModeState() {
+  const now = Date.now();
+  const nextAllowedAt = userModeLastDownloadAt + USER_MODE_DOWNLOAD_LIMIT_MS;
+  const remainingMs = crawlcastMode === 'user'
+    ? Math.max(0, nextAllowedAt - now)
+    : 0;
+
+  return {
+    mode: crawlcastMode,
+    lastDownloadAt: userModeLastDownloadAt,
+    nextAllowedAt: remainingMs > 0 ? nextAllowedAt : 0,
+    remainingMs,
+    canDownload: crawlcastMode === 'god' || remainingMs === 0
+  };
+}
 
 chrome.downloads.onChanged.addListener((delta) => {
   const state = delta.state && delta.state.current;
@@ -78,14 +106,12 @@ async function remuxDownloadedFile(downloadId, streamUrl) {
 
   port.onMessage.addListener((msg) => {
     if (msg.type === 'remuxed') {
-      trackEvent('remux_complete', { bytes: msg.bytes || 0, merged: !!msg.merged });
       broadcast({
         action: 'remuxComplete', url: streamUrl, path: msg.path, merged: !!msg.merged
       });
       port.disconnect();
     } else if (msg.type === 'remuxSkipped' || msg.type === 'error') {
       console.log('[Remux] Skipped:', msg.message);
-      trackEvent('remux_skipped', {});
       broadcast({ action: 'remuxSkipped', url: streamUrl, message: msg.message });
       port.disconnect();
     }
@@ -212,7 +238,6 @@ chrome.webRequest.onBeforeRequest.addListener(
 
     persistStreams();
     updateBadge(details.tabId);
-    trackEvent('stream_detected', { host: new URL(url).hostname });
     console.log('[M3U8 Detector] Found:', url);
   },
   { urls: ["<all_urls>"] },
@@ -251,6 +276,27 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return false;
   }
 
+  if (request.action === 'getModeState') {
+    modeStateRestored.then(() => {
+      sendResponse({ success: true, ...getModeState() });
+    });
+    return true;
+  }
+
+  if (request.action === 'setMode') {
+    modeStateRestored.then(async () => {
+      if (request.mode !== 'user' && request.mode !== 'god') {
+        sendResponse({ success: false, error: 'Invalid mode' });
+        return;
+      }
+
+      crawlcastMode = request.mode;
+      await chrome.storage.local.set({ crawlcastMode });
+      sendResponse({ success: true, ...getModeState() });
+    });
+    return true;
+  }
+
 
   // Get streams for popup
   if (request.action === 'getStreams') {
@@ -263,6 +309,24 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         .map(s => ({ ...s, downloading: activeDownloads.has(s.url) }));
       sendResponse({ streams });
     });
+  }
+
+  // Persist a user-edited title on the detected stream so it survives
+  // popup closes for as long as the stream remains in session storage.
+  if (request.action === 'setStreamTitle') {
+    streamsRestored.then(() => {
+      const stream = detectedStreams.get(request.url);
+      if (!stream) {
+        sendResponse({ success: false, error: 'Stream not found' });
+        return;
+      }
+
+      const title = typeof request.title === 'string' ? request.title.trim() : '';
+      stream.title = title || null;
+      persistStreams();
+      sendResponse({ success: true, title: stream.title });
+    });
+    return true;
   }
 
   // Clear streams
@@ -301,8 +365,46 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
   // Start download
   if (request.action === 'startDownload') {
-    startDownload(request.url, request.filename, sender.tab?.id || request.tabId);
-    sendResponse({ success: true, downloadId: request.url });
+    modeStateRestored.then(async () => {
+      const now = Date.now();
+      const state = getModeState();
+
+      if (crawlcastMode === 'user' && !state.canDownload) {
+        sendResponse({
+          success: false,
+          reason: 'rate_limit',
+          ...state
+        });
+        return;
+      }
+
+      // Consume the User Mode slot as soon as the background accepts the
+      // download. This prevents a second popup click/reopen from bypassing
+      // the rolling-hour limit while the first download is still running.
+      const consumedUserSlot = crawlcastMode === 'user';
+      if (consumedUserSlot) {
+        userModeLastDownloadAt = now;
+        await chrome.storage.local.set({ userModeLastDownloadAt });
+      }
+
+      try {
+        await startDownload(request.url, request.filename, sender.tab?.id || request.tabId);
+        sendResponse({
+          success: true,
+          downloadId: request.url,
+          ...getModeState()
+        });
+      } catch (err) {
+        // If Crawlcast could not even start its download pipeline, give the
+        // User Mode slot back. Later network/download failures still count.
+        if (consumedUserSlot && userModeLastDownloadAt === now) {
+          userModeLastDownloadAt = 0;
+          await chrome.storage.local.set({ userModeLastDownloadAt: 0 });
+        }
+        sendResponse({ success: false, error: err?.message || String(err), ...getModeState() });
+      }
+    });
+    return true;
   }
 
 
@@ -341,19 +443,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       url: request.blobUrl,
       filename: request.filename
     }).then(async (downloadId) => {
-      const info = activeDownloads.get(request.streamUrl);
       activeDownloads.delete(request.streamUrl);
       pendingBlobUrls.set(downloadId, {
         blobUrl: request.blobUrl,
         streamUrl: request.streamUrl
-      });
-
-      const stats = request.stats || {};
-      trackEvent('download_complete', {
-        bytes: stats.bytesDownloaded || 0,
-        segments: stats.downloaded || 0,
-        failedSegments: stats.failed || 0,
-        ms: info ? Date.now() - info.startTime : 0
       });
 
       chrome.runtime.sendMessage({
@@ -404,7 +497,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   // (the popup receives the same broadcast directly)
   if (request.action === 'downloadError') {
     activeDownloads.delete(request.url);
-    trackEvent('download_error', { message: String(request.error).slice(0, 200) });
     maybeCloseOffscreen();
   }
 
@@ -455,7 +547,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         if (request.frames) stream.frames = request.frames; // hover animation frames
         persistStreams();
       }
-      trackEvent('thumbnail_generated', { ok: !!request.thumbnail });
       maybeCloseOffscreen();
     });
   }
@@ -509,8 +600,6 @@ async function startDownload(url, filename, tabId) {
   });
 
   await ensureOffscreenDocument();
-  trackEvent('download_start');
-
   chrome.runtime.sendMessage({
     target: 'offscreen',
     action: 'downloadStream',
