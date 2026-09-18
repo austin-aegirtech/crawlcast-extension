@@ -12,6 +12,7 @@ let currentPageTitle = '';
 // resets or bypasses the rolling download limit.
 let currentMode = 'user';
 let userModeNextAllowedAt = 0;
+let rateLimitCountdownTimer = null;
 
 // Initialize
 document.addEventListener('DOMContentLoaded', () => {
@@ -136,13 +137,75 @@ function applyModeState(state) {
 
   if (isGodMode) {
     button.title = 'God Mode — unlimited downloads';
-    return;
+  } else {
+    updateUserModeTitle();
   }
+
+  syncRateLimitUI();
+}
+
+function isUserModeRateLimited() {
+  return currentMode === 'user' && userModeNextAllowedAt > Date.now();
+}
+
+function updateUserModeTitle() {
+  const button = document.getElementById('modeToggle');
+  if (!button || currentMode !== 'user') return;
 
   const remainingMs = Math.max(0, userModeNextAllowedAt - Date.now());
   button.title = remainingMs > 0
     ? `User Mode — next download available in ${formatRemainingTime(remainingMs)}`
     : 'User Mode — 1 download per hour';
+}
+
+function syncRateLimitUI() {
+  if (rateLimitCountdownTimer) {
+    clearInterval(rateLimitCountdownTimer);
+    rateLimitCountdownTimer = null;
+  }
+
+  updateRateLimitCountdown();
+
+  if (!isUserModeRateLimited()) return;
+
+  rateLimitCountdownTimer = setInterval(() => {
+    updateRateLimitCountdown();
+  }, 1000);
+}
+
+function updateRateLimitCountdown() {
+  const indicator = document.getElementById('premiumLimitCountdown');
+  const value = document.getElementById('premiumCountdownValue');
+  if (!indicator || !value) return;
+
+  const remainingMs = Math.max(0, userModeNextAllowedAt - Date.now());
+  const limited = currentMode === 'user' && remainingMs > 0;
+
+  indicator.hidden = !limited;
+
+  document.querySelectorAll('.download-btn').forEach((button) => {
+    const isIdle = button.dataset.state === 'idle';
+    if (limited) {
+      if (isIdle) button.disabled = true;
+    } else if (isIdle) {
+      button.disabled = false;
+    }
+  });
+
+  if (!limited) {
+    if (rateLimitCountdownTimer) {
+      clearInterval(rateLimitCountdownTimer);
+      rateLimitCountdownTimer = null;
+    }
+    if (currentMode === 'user' && userModeNextAllowedAt > 0) {
+      userModeNextAllowedAt = 0;
+    }
+    updateUserModeTitle();
+    return;
+  }
+
+  value.textContent = formatCountdown(remainingMs);
+  updateUserModeTitle();
 }
 
 async function loadStreams() {
@@ -201,6 +264,7 @@ function renderStreams(streams, tabId, pageTitle = currentPageTitle) {
   listEl.innerHTML = streams.map((stream) => {
     const isComplete = completedDownloadsUI.has(stream.url);
     const isDownloading = !isComplete && (activeDownloadsUI.has(stream.url) || stream.downloading);
+    const isRateLimited = isUserModeRateLimited();
     const hash = hashCode(stream.url);
     const displayTitle = getStreamTitle(stream, pageTitle);
     const duration = stream.meta?.durationSeconds
@@ -257,8 +321,9 @@ function renderStreams(streams, tabId, pageTitle = currentPageTitle) {
                 id="download-${hash}"
                 data-url="${escapeHtml(stream.url)}"
                 data-tab="${tabId}"
+                data-state="${isComplete ? 'complete' : (isDownloading ? 'downloading' : 'idle')}"
                 type="button"
-                ${isDownloading || isComplete ? 'disabled' : ''}
+                ${isDownloading || isComplete || isRateLimited ? 'disabled' : ''}
               >
                 <span class="download-icon">${isComplete ? '✓' : '↓'}</span>
                 <span>${isComplete ? 'Complete!' : (isDownloading ? 'Downloading…' : 'Download')}</span>
@@ -438,6 +503,7 @@ function markDownloadComplete(url) {
 
   const btn = document.getElementById(`download-${hash}`);
   if (btn) {
+    btn.dataset.state = 'complete';
     btn.disabled = true;
     btn.innerHTML = '<span class="download-icon">✓</span><span>Complete!</span>';
   }
@@ -454,7 +520,8 @@ function markRepairSkipped(url) {
 
   const btn = document.getElementById(`download-${hash}`);
   if (btn) {
-    btn.disabled = false;
+    btn.dataset.state = 'idle';
+    btn.disabled = isUserModeRateLimited();
     btn.innerHTML = '<span class="download-icon">↓</span><span>Download</span>';
   }
 }
@@ -666,6 +733,13 @@ function formatRemainingTime(ms) {
     return `${minutes}m ${String(seconds).padStart(2, '0')}s`;
   }
   return `${seconds}s`;
+}
+
+function formatCountdown(ms) {
+  const totalSeconds = Math.max(0, Math.ceil((Number(ms) || 0) / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
 }
 
 // Utility functions
