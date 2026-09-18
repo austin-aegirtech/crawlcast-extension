@@ -27,7 +27,6 @@ function initAppHandlers() {
   if (appHandlersInitialized) return;
   appHandlersInitialized = true;
 
-  document.getElementById('refreshBtn').addEventListener('click', loadStreams);
   document.getElementById('clearBtn').addEventListener('click', clearStreams);
   document.getElementById('premiumBtn').addEventListener('click', showPremiumComingSoon);
   document.getElementById('premiumClose').addEventListener('click', closePremium);
@@ -255,7 +254,7 @@ function renderStreams(streams, tabId, pageTitle = currentPageTitle) {
           <path d="M12 8v8M8 12h8"/>
         </svg>
         <strong>No M3U8 streams detected</strong>
-        <span>Play a video on this page, then refresh if needed.</span>
+        <span>Play a video on this page and Crawlcast will detect available streams.</span>
       </div>
     `;
     return;
