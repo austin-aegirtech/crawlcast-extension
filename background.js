@@ -11,6 +11,36 @@ const activeDownloads = new Map();
 // downloaded video stays in memory for the life of the offscreen document.
 const pendingBlobUrls = new Map();
 
+// Free-tier mode state. User Mode allows one accepted download start per
+// rolling 60-minute window; God Mode bypasses the limit. Keep this in
+// storage.local so the limit survives popup closes and browser restarts.
+const USER_MODE_DOWNLOAD_LIMIT_MS = 60 * 60 * 1000;
+let crawlcastMode = 'user';
+let userModeLastDownloadAt = 0;
+
+const modeStateRestored = chrome.storage.local
+  .get(['crawlcastMode', 'userModeLastDownloadAt'])
+  .then((data) => {
+    crawlcastMode = data.crawlcastMode === 'god' ? 'god' : 'user';
+    userModeLastDownloadAt = Number(data.userModeLastDownloadAt) || 0;
+  });
+
+function getModeState() {
+  const now = Date.now();
+  const nextAllowedAt = userModeLastDownloadAt + USER_MODE_DOWNLOAD_LIMIT_MS;
+  const remainingMs = crawlcastMode === 'user'
+    ? Math.max(0, nextAllowedAt - now)
+    : 0;
+
+  return {
+    mode: crawlcastMode,
+    lastDownloadAt: userModeLastDownloadAt,
+    nextAllowedAt: remainingMs > 0 ? nextAllowedAt : 0,
+    remainingMs,
+    canDownload: crawlcastMode === 'god' || remainingMs === 0
+  };
+}
+
 chrome.downloads.onChanged.addListener((delta) => {
   const state = delta.state && delta.state.current;
   if (state !== 'complete' && state !== 'interrupted') return;
@@ -251,6 +281,27 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return false;
   }
 
+  if (request.action === 'getModeState') {
+    modeStateRestored.then(() => {
+      sendResponse({ success: true, ...getModeState() });
+    });
+    return true;
+  }
+
+  if (request.action === 'setMode') {
+    modeStateRestored.then(async () => {
+      if (request.mode !== 'user' && request.mode !== 'god') {
+        sendResponse({ success: false, error: 'Invalid mode' });
+        return;
+      }
+
+      crawlcastMode = request.mode;
+      await chrome.storage.local.set({ crawlcastMode });
+      sendResponse({ success: true, ...getModeState() });
+    });
+    return true;
+  }
+
 
   // Get streams for popup
   if (request.action === 'getStreams') {
@@ -301,8 +352,46 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
   // Start download
   if (request.action === 'startDownload') {
-    startDownload(request.url, request.filename, sender.tab?.id || request.tabId);
-    sendResponse({ success: true, downloadId: request.url });
+    modeStateRestored.then(async () => {
+      const now = Date.now();
+      const state = getModeState();
+
+      if (crawlcastMode === 'user' && !state.canDownload) {
+        sendResponse({
+          success: false,
+          reason: 'rate_limit',
+          ...state
+        });
+        return;
+      }
+
+      // Consume the User Mode slot as soon as the background accepts the
+      // download. This prevents a second popup click/reopen from bypassing
+      // the rolling-hour limit while the first download is still running.
+      const consumedUserSlot = crawlcastMode === 'user';
+      if (consumedUserSlot) {
+        userModeLastDownloadAt = now;
+        await chrome.storage.local.set({ userModeLastDownloadAt });
+      }
+
+      try {
+        await startDownload(request.url, request.filename, sender.tab?.id || request.tabId);
+        sendResponse({
+          success: true,
+          downloadId: request.url,
+          ...getModeState()
+        });
+      } catch (err) {
+        // If Crawlcast could not even start its download pipeline, give the
+        // User Mode slot back. Later network/download failures still count.
+        if (consumedUserSlot && userModeLastDownloadAt === now) {
+          userModeLastDownloadAt = 0;
+          await chrome.storage.local.set({ userModeLastDownloadAt: 0 });
+        }
+        sendResponse({ success: false, error: err?.message || String(err), ...getModeState() });
+      }
+    });
+    return true;
   }
 
 

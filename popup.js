@@ -8,9 +8,15 @@ const thumbFrames = new Map();
 // Current page title is used for card labels and download filenames.
 let currentPageTitle = '';
 
+// Free-tier mode state comes from background.js so closing the popup never
+// resets or bypasses the rolling download limit.
+let currentMode = 'user';
+let userModeNextAllowedAt = 0;
+
 // Initialize
 document.addEventListener('DOMContentLoaded', () => {
   initAppHandlers();
+  loadModeState();
   loadStreams();
 });
 
@@ -24,6 +30,7 @@ function initAppHandlers() {
   document.getElementById('clearBtn').addEventListener('click', clearStreams);
   document.getElementById('premiumBtn').addEventListener('click', showPremiumComingSoon);
   document.getElementById('premiumClose').addEventListener('click', closePremium);
+  document.getElementById('modeToggle').addEventListener('click', toggleMode);
 
   document.getElementById('logsBtn').addEventListener('click', toggleLogs);
   document.getElementById('logClose').addEventListener('click', () => setLogsOpen(false));
@@ -92,6 +99,50 @@ function initAppHandlers() {
       }
     }
   });
+}
+
+async function loadModeState() {
+  const response = await chrome.runtime.sendMessage({ action: 'getModeState' }).catch(() => null);
+  if (response?.success) applyModeState(response);
+}
+
+async function toggleMode() {
+  const button = document.getElementById('modeToggle');
+  const nextMode = currentMode === 'user' ? 'god' : 'user';
+  button.disabled = true;
+
+  try {
+    const response = await chrome.runtime.sendMessage({
+      action: 'setMode',
+      mode: nextMode
+    });
+    if (response?.success) applyModeState(response);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function applyModeState(state) {
+  currentMode = state.mode === 'god' ? 'god' : 'user';
+  userModeNextAllowedAt = Number(state.nextAllowedAt) || 0;
+
+  const button = document.getElementById('modeToggle');
+  const label = document.getElementById('modeLabel');
+  const isGodMode = currentMode === 'god';
+
+  button.classList.toggle('god', isGodMode);
+  button.setAttribute('aria-pressed', String(isGodMode));
+  label.textContent = isGodMode ? 'God Mode' : 'User Mode';
+
+  if (isGodMode) {
+    button.title = 'God Mode — unlimited downloads';
+    return;
+  }
+
+  const remainingMs = Math.max(0, userModeNextAllowedAt - Date.now());
+  button.title = remainingMs > 0
+    ? `User Mode — next download available in ${formatRemainingTime(remainingMs)}`
+    : 'User Mode — 1 download per hour';
 }
 
 async function loadStreams() {
@@ -275,24 +326,40 @@ async function startDownload(url, tabId) {
   currentPageTitle = tab?.title || currentPageTitle;
   const filename = buildDownloadFilename(currentPageTitle);
 
-  // Update UI state
-  completedDownloadsUI.delete(url);
-  activeDownloadsUI.set(url, { startTime: Date.now() });
-  
-  // Re-render to show progress UI
-  const response = await chrome.runtime.sendMessage({ 
-    action: 'getStreams', 
-    tabId: tab.id 
-  });
-  renderStreams(response.streams || [], tab.id, currentPageTitle);
-  
-  // Start download in background
-  await chrome.runtime.sendMessage({
+  // Ask the background worker first. User Mode is enforced there so popup
+  // closes/reopens cannot reset or bypass the rolling-hour limit.
+  const startResult = await chrome.runtime.sendMessage({
     action: 'startDownload',
     url: url,
     filename: filename,
     tabId: parseInt(tabId)
   });
+
+  if (startResult?.mode) applyModeState(startResult);
+
+  if (!startResult?.success) {
+    if (startResult?.reason === 'rate_limit') {
+      setStatus(
+        url,
+        'status-warn',
+        `⏱️ User Mode allows 1 download per hour. Try again in ${formatRemainingTime(startResult.remainingMs)}.`
+      );
+      return;
+    }
+
+    setStatus(url, 'status-error', `❌ ${startResult?.error || 'Could not start download'}`);
+    return;
+  }
+
+  completedDownloadsUI.delete(url);
+  activeDownloadsUI.set(url, { startTime: Date.now() });
+
+  // Re-render to show progress UI using the background worker's live state.
+  const response = await chrome.runtime.sendMessage({
+    action: 'getStreams',
+    tabId: tab.id
+  });
+  renderStreams(response.streams || [], tab.id, currentPageTitle);
 }
 
 function updateDownloadProgress(url, progress) {
@@ -588,6 +655,17 @@ function formatDurationCompact(seconds) {
   return h > 0
     ? `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
     : `${m}:${String(s).padStart(2, '0')}`;
+}
+
+function formatRemainingTime(ms) {
+  const totalSeconds = Math.max(1, Math.ceil((Number(ms) || 0) / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+
+  if (minutes >= 1) {
+    return `${minutes}m ${String(seconds).padStart(2, '0')}s`;
+  }
+  return `${seconds}s`;
 }
 
 // Utility functions
