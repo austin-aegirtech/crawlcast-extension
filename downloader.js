@@ -23,7 +23,14 @@ class VideoDownloader {
     // Fetch concurrency: how many segment downloads run in parallel.
     // Safe because only *fetching* is parallel — segments are pushed
     // through the shared transmuxer and written strictly in order.
-    this.concurrency = 4;
+    this.concurrency = 2;
+
+    // Segment retries share a cooldown so a temporary CDN/server failure
+    // does not cause the rest of the fetch window to keep hammering it.
+    this.retryPauseUntil = 0;
+    this.maxSegmentAttempts = options.maxSegmentAttempts || 20;
+    this.maxRetryDelayMs = options.maxRetryDelayMs || 15000;
+    this.retryableHttpStatuses = new Set([429, 500, 502, 503, 504]);
 
     // Per-attempt segment fetch timeout (ms). Guards against servers that
     // accept the connection then never send data.
@@ -241,10 +248,19 @@ class VideoDownloader {
         }
       }
 
-      // Consume in order
-      const arrayBuffer = await pending.get(i);
+      // Consume in order. A segment that exhausts its retries is fatal:
+      // silently skipping it can produce a corrupt movie that appears to
+      // have downloaded successfully. Abort the remaining fetch window too.
+      let arrayBuffer;
+      try {
+        arrayBuffer = await pending.get(i);
+      } catch (error) {
+        pending.delete(i);
+        this.abortController.abort();
+        throw error;
+      }
       pending.delete(i);
-      if (arrayBuffer === null) continue; // failed after retries — skip segment
+      if (arrayBuffer === null) break; // user cancelled
 
       // Check if it's TS format (typical for HLS)
       const isTS = this.isTransportStream(arrayBuffer);
@@ -320,7 +336,7 @@ class VideoDownloader {
       if (this.abortController.signal.aborted) break;
 
       const buf = await this.fetchSegmentWithRetry(audioPlaylist.segments[i], i);
-      if (buf === null) continue; // skip, same policy as video
+      if (buf === null) break; // user cancelled
 
       const view = new Uint8Array(buf);
       const isTS = view[0] === 0x47 && view[188] === 0x47;
@@ -385,26 +401,71 @@ class VideoDownloader {
   }
 
   /**
+   * Return a Retry-After delay in milliseconds when the server provides one.
+   * Supports both the integer-seconds and HTTP-date forms defined by HTTP.
+   */
+  getRetryAfterMs(response) {
+    const value = response?.headers?.get?.('Retry-After');
+    if (!value) return 0;
+
+    const seconds = Number(value);
+    if (Number.isFinite(seconds) && seconds >= 0) {
+      return Math.round(seconds * 1000);
+    }
+
+    const date = Date.parse(value);
+    return Number.isFinite(date) ? Math.max(0, date - Date.now()) : 0;
+  }
+
+  /** Exponential retry delay with jitter, capped at maxRetryDelayMs. */
+  getRetryDelayMs(attempt, retryAfterMs = 0) {
+    const exponential = 1000 * (2 ** (attempt - 1));
+    const jittered = Math.round(exponential * (0.75 + Math.random() * 0.5));
+    const capped = Math.min(jittered, this.maxRetryDelayMs);
+    return Math.max(capped, retryAfterMs);
+  }
+
+  /** Extend the shared CDN/server cooldown without shortening an existing one. */
+  extendRetryPause(delayMs) {
+    this.retryPauseUntil = Math.max(this.retryPauseUntil, Date.now() + delayMs);
+  }
+
+  /** Wait until the current shared cooldown expires (or the user cancels). */
+  async waitForRetryPause() {
+    while (!this.abortController.signal.aborted) {
+      const remaining = this.retryPauseUntil - Date.now();
+      if (remaining <= 0) return;
+      await this.delay(remaining);
+    }
+  }
+
+  /**
    * Fetch a single segment with retries and exponential backoff.
-   * @returns {Promise<ArrayBuffer|null>} null if all attempts failed
+   * Temporary CDN/server errors (429/5xx) respect Retry-After and pause the
+   * shared fetch window. Permanent HTTP errors fail immediately.
+   * @returns {Promise<ArrayBuffer|null>} null only when the user cancels
    */
   async fetchSegmentWithRetry(segment, index) {
-    const maxRetries = 20;
+    const segmentNumber = index + 1;
 
-    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    for (let attempt = 1; attempt <= this.maxSegmentAttempts; attempt++) {
+      await this.waitForRetryPause();
+      if (this.abortController.signal.aborted) return null;
+
       // Per-attempt timeout. Without this a server that accepts the
-      // connection but never responds hangs the await forever — the retry
-      // logic never fires and the whole download stalls silently.
+      // connection but never responds hangs the await forever.
       const timeoutController = new AbortController();
       const timer = setTimeout(() => timeoutController.abort(), this.segmentTimeoutMs);
 
-      // Abort if EITHER the user cancels or this attempt times out
+      // Abort if EITHER the user cancels or this attempt times out.
       const signal = (typeof AbortSignal !== 'undefined' && AbortSignal.any)
         ? AbortSignal.any([this.abortController.signal, timeoutController.signal])
         : timeoutController.signal;
 
       try {
-        console.log(`[Downloader] Fetching segment ${index + 1}/${this.stats.totalSegments}`);
+        if (attempt === 1) {
+          console.log(`[Downloader] Fetching segment ${segmentNumber}/${this.stats.totalSegments}`);
+        }
 
         const response = await fetch(segment.url, {
           signal,
@@ -415,7 +476,13 @@ class VideoDownloader {
           }
         });
 
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        if (!response.ok) {
+          const error = new Error(`HTTP ${response.status}`);
+          error.httpStatus = response.status;
+          error.retryable = this.retryableHttpStatuses.has(response.status);
+          error.retryAfterMs = this.getRetryAfterMs(response);
+          throw error;
+        }
 
         const arrayBuffer = await response.arrayBuffer();
         this.stats.bytesDownloaded += arrayBuffer.byteLength;
@@ -423,23 +490,48 @@ class VideoDownloader {
 
       } catch (error) {
         if (this.abortController.signal.aborted) return null; // user cancelled
-        const timedOut = timeoutController.signal.aborted;
-        console.warn(
-          `[Downloader] Segment ${index} failed (attempt ${attempt})`,
-          timedOut ? `— timed out after ${this.segmentTimeoutMs}ms` : error
-        );
 
-        if (attempt >= maxRetries) {
+        const timedOut = timeoutController.signal.aborted;
+        const retryable = timedOut || error.retryable !== false;
+        const reason = timedOut
+          ? `timeout after ${this.segmentTimeoutMs}ms`
+          : (error.httpStatus ? `HTTP ${error.httpStatus}` : (error.message || 'network error'));
+
+        // 4xx responses other than 429 are generally permanent. Retrying them
+        // 20 times only slows the failure and increases load on the origin.
+        if (!retryable) {
           this.stats.failed++;
-          console.error(`[Downloader] Failed to download segment ${index} after ${maxRetries} attempts`);
-          return null;
+          const terminal = new Error(
+            `Segment ${segmentNumber}/${this.stats.totalSegments} failed permanently (${reason})`
+          );
+          terminal.cause = error;
+          console.error(`[Downloader] ${terminal.message}`);
+          throw terminal;
         }
-        // Exponential backoff
-        await this.delay(1000 * attempt);
+
+        if (attempt >= this.maxSegmentAttempts) {
+          this.stats.failed++;
+          const terminal = new Error(
+            `Segment ${segmentNumber}/${this.stats.totalSegments} failed after ` +
+            `${this.maxSegmentAttempts} attempts (${reason})`
+          );
+          terminal.cause = error;
+          console.error(`[Downloader] ${terminal.message}`);
+          throw terminal;
+        }
+
+        const delayMs = this.getRetryDelayMs(attempt, error.retryAfterMs || 0);
+        this.extendRetryPause(delayMs);
+        console.log(
+          `[Downloader] Segment ${segmentNumber}/${this.stats.totalSegments} temporarily unavailable ` +
+          `(${reason}) — retrying in ${(delayMs / 1000).toFixed(1)}s`
+        );
+        await this.waitForRetryPause();
       } finally {
         clearTimeout(timer);
       }
     }
+
     return null;
   }
 
@@ -560,7 +652,24 @@ class VideoDownloader {
   }
 
   delay(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
+    return new Promise((resolve) => {
+      if (this.abortController.signal.aborted) {
+        resolve();
+        return;
+      }
+
+      const timer = setTimeout(done, ms);
+      const onAbort = () => done();
+
+      function done() {
+        clearTimeout(timer);
+        thisSignal.removeEventListener('abort', onAbort);
+        resolve();
+      }
+
+      const thisSignal = this.abortController.signal;
+      thisSignal.addEventListener('abort', onAbort, { once: true });
+    });
   }
 
   /**
