@@ -9,6 +9,56 @@ const activeDownloads = new Map();
 // downloaded video stays in memory for the life of the offscreen document.
 const pendingBlobUrls = new Map();
 
+// Direct MP4 downloads are owned by chrome.downloads instead of the HLS
+// offscreen pipeline. Keep the browser download id mapped back to the
+// detected stream so progress, cancellation, and post-download repair can
+// use the same popup UI as HLS downloads.
+const directDownloads = new Map();
+
+function persistDirectDownloads() {
+  chrome.storage.session.set({ directDownloads: Array.from(directDownloads.entries()) });
+}
+
+const directDownloadsRestored = chrome.storage.session.get('directDownloads').then(async (data) => {
+  for (const [downloadId, entry] of (data.directDownloads || [])) {
+    const numericId = Number(downloadId);
+    if (!Number.isInteger(numericId) || !entry?.streamUrl) continue;
+
+    directDownloads.set(numericId, entry);
+    activeDownloads.set(entry.streamUrl, {
+      kind: 'direct',
+      progress: {
+        kind: 'direct',
+        phase: 'downloading',
+        percent: entry.totalBytes > 0
+          ? Math.min(99, Math.round(((entry.bytesReceived || 0) / entry.totalBytes) * 100))
+          : 0,
+        bytesReceived: entry.bytesReceived || 0,
+        totalBytes: entry.totalBytes || 0,
+        mbDownloaded: ((entry.bytesReceived || 0) / 1e6).toFixed(1)
+      },
+      startTime: entry.startTime || Date.now(),
+      lastProgressAt: Date.now(),
+      downloadId: numericId
+    });
+
+    const [item] = await chrome.downloads.search({ id: numericId });
+    if (!item || item.state === 'interrupted') {
+      directDownloads.delete(numericId);
+      activeDownloads.delete(entry.streamUrl);
+      continue;
+    }
+
+    entry.bytesReceived = item.bytesReceived || entry.bytesReceived || 0;
+    entry.totalBytes = item.totalBytes || entry.totalBytes || 0;
+
+    if (item.state === 'complete') {
+      completeDirectDownload(numericId, entry);
+    }
+  }
+  persistDirectDownloads();
+});
+
 // Free-tier mode state. User Mode allows one accepted download start per
 // rolling 60-minute window; God Mode bypasses the limit. Keep this in
 // storage.local so the limit survives popup closes and browser restarts.
@@ -40,18 +90,92 @@ function getModeState() {
 }
 
 chrome.downloads.onChanged.addListener((delta) => {
-  const state = delta.state && delta.state.current;
-  if (state !== 'complete' && state !== 'interrupted') return;
-
-  const entry = pendingBlobUrls.get(delta.id);
-  releaseBlobUrl(delta.id);
-
-  // Repair the saved file once it's fully written to disk
-  if (state === 'complete' && entry) {
-    remuxDownloadedFile(delta.id, entry.streamUrl).catch((e) =>
-      console.log('[Remux] Skipped:', e.message));
+  const direct = directDownloads.get(delta.id);
+  if (direct) {
+    handleDirectDownloadDelta(delta, direct);
+    return;
   }
+
+  const state = delta.state && delta.state.current;
+  const entry = pendingBlobUrls.get(delta.id);
+
+  if (entry && (state === 'complete' || state === 'interrupted')) {
+    releaseBlobUrl(delta.id);
+
+    // Repair the saved HLS file once it's fully written to disk.
+    if (state === 'complete') {
+      remuxDownloadedFile(delta.id, entry.streamUrl).catch((e) =>
+        console.log('[Remux] Skipped:', e.message));
+    }
+    return;
+  }
+
+  // A direct browser download can outlive the MV3 service worker. If the
+  // worker restarted, wait for its session mapping to restore before deciding
+  // that this download is unrelated to Crawlcast.
+  directDownloadsRestored.then(() => {
+    const restored = directDownloads.get(delta.id);
+    if (restored) handleDirectDownloadDelta(delta, restored);
+  });
 });
+
+function handleDirectDownloadDelta(delta, entry) {
+  if (delta.bytesReceived && Number.isFinite(delta.bytesReceived.current)) {
+    entry.bytesReceived = delta.bytesReceived.current;
+  }
+  if (delta.totalBytes && Number.isFinite(delta.totalBytes.current)) {
+    entry.totalBytes = delta.totalBytes.current;
+  }
+  persistDirectDownloads();
+
+  const active = activeDownloads.get(entry.streamUrl);
+  if (active) {
+    active.lastProgressAt = Date.now();
+    active.progress = {
+      kind: 'direct',
+      phase: 'downloading',
+      bytesReceived: entry.bytesReceived || 0,
+      totalBytes: entry.totalBytes || 0,
+      mbDownloaded: ((entry.bytesReceived || 0) / 1e6).toFixed(1),
+      percent: entry.totalBytes > 0
+        ? Math.min(99, Math.round((entry.bytesReceived / entry.totalBytes) * 100))
+        : 0
+    };
+    broadcast({ action: 'downloadProgress', url: entry.streamUrl, progress: active.progress });
+  }
+
+  const state = delta.state && delta.state.current;
+  if (state === 'complete') {
+    completeDirectDownload(delta.id, entry);
+  } else if (state === 'interrupted') {
+    directDownloads.delete(delta.id);
+    activeDownloads.delete(entry.streamUrl);
+    persistDirectDownloads();
+    broadcast({
+      action: 'downloadError',
+      url: entry.streamUrl,
+      error: delta.error?.current || 'MP4 download interrupted'
+    });
+    maybeCloseOffscreen();
+  }
+}
+
+function completeDirectDownload(downloadId, entry) {
+  if (!directDownloads.has(downloadId)) return;
+  directDownloads.delete(downloadId);
+  activeDownloads.delete(entry.streamUrl);
+  persistDirectDownloads();
+
+  broadcast({
+    action: 'downloadComplete',
+    url: entry.streamUrl,
+    result: { filename: entry.filename }
+  });
+
+  remuxDownloadedFile(downloadId, entry.streamUrl).catch((e) =>
+    console.log('[Remux] Skipped:', e.message));
+  maybeCloseOffscreen();
+}
 
 function releaseBlobUrl(downloadId) {
   const entry = pendingBlobUrls.get(downloadId);
@@ -187,7 +311,9 @@ function stringifyArg(a) {
 // Close the offscreen document when nothing needs it, freeing all
 // download memory. It's recreated on demand by ensureOffscreenDocument().
 async function maybeCloseOffscreen() {
-  if (activeDownloads.size > 0 || pendingBlobUrls.size > 0 || thumbnailJobs.size > 0) return;
+  const hasOffscreenDownload = Array.from(activeDownloads.values())
+    .some((info) => info.kind !== 'direct');
+  if (hasOffscreenDownload || pendingBlobUrls.size > 0 || thumbnailJobs.size > 0) return;
   try {
     await chrome.offscreen.closeDocument();
   } catch (e) {
@@ -208,16 +334,29 @@ function persistStreams() {
   chrome.storage.session.set({ detectedStreams: Array.from(detectedStreams.entries()) });
 }
 
-// Pattern to match m3u8 URLs
-const M3U8_PATTERN = /\.m3u8($|\?)/i;
+// Direct media formats Crawlcast can download. HLS keeps its existing
+// playlist pipeline; MP4 uses chrome.downloads directly.
+const M3U8_PATTERN = /\.m3u8(?:$|[?#])/i;
+const MP4_PATTERN = /\.mp4(?:$|[?#])/i;
+
+function getStreamFormat(streamOrUrl) {
+  if (streamOrUrl && typeof streamOrUrl === 'object' && streamOrUrl.format) {
+    return streamOrUrl.format;
+  }
+  const url = typeof streamOrUrl === 'string' ? streamOrUrl : streamOrUrl?.url || '';
+  if (MP4_PATTERN.test(url)) return 'mp4';
+  if (M3U8_PATTERN.test(url)) return 'm3u8';
+  return null;
+}
 
 // Listen for network requests
 chrome.webRequest.onBeforeRequest.addListener(
   (details) => {
     const url = details.url;
-    
+    const format = getStreamFormat(url);
+
     if (detectedStreams.has(url)) return;
-    if (!M3U8_PATTERN.test(url)) return;
+    if (!format) return;
 
     const streamInfo = {
       url: url,
@@ -225,6 +364,7 @@ chrome.webRequest.onBeforeRequest.addListener(
       tabId: details.tabId,
       type: details.type,
       initiator: details.initiator || 'unknown',
+      format,
       title: null // Will be populated from page
     };
     
@@ -238,7 +378,7 @@ chrome.webRequest.onBeforeRequest.addListener(
 
     persistStreams();
     updateBadge(details.tabId);
-    console.log('[M3U8 Detector] Found:', url);
+    console.log(`[${format.toUpperCase()} Detector] Found:`, url);
   },
   { urls: ["<all_urls>"] },
   ["requestBody"]
@@ -300,7 +440,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
   // Get streams for popup
   if (request.action === 'getStreams') {
-    streamsRestored.then(() => {
+    Promise.all([streamsRestored, directDownloadsRestored]).then(() => {
       const streams = Array.from(detectedStreams.values())
         .filter(s => s.tabId === request.tabId)
         .sort((a, b) => b.timestamp - a.timestamp)
@@ -506,6 +646,9 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       const targets = (request.urls || []).filter((url) => {
         const s = detectedStreams.get(url);
         if (!s || thumbnailJobs.has(url)) return false;
+        // Direct MP4s do not need the HLS parser/thumbnail pipeline. They
+        // download straight through chrome.downloads and use a placeholder.
+        if (getStreamFormat(s) === 'mp4') return false;
         // The same job produces both the preview and the size metadata,
         // so run it if either is still missing and hasn't already failed
         return (!s.thumbnail && !s.thumbnailTried) || (!s.meta && !s.metaTried);
@@ -556,12 +699,21 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   // so forward the request there; also release our own tracking immediately
   // so a wedged offscreen doc can never lock the UI permanently.
   if (request.action === 'cancelDownload') {
+    const active = activeDownloads.get(request.url);
     activeDownloads.delete(request.url);
-    chrome.runtime.sendMessage({
-      target: 'offscreen',
-      action: 'cancelDownload',
-      url: request.url
-    }).catch(() => {});
+
+    if (active?.kind === 'direct' && Number.isInteger(active.downloadId)) {
+      directDownloads.delete(active.downloadId);
+      persistDirectDownloads();
+      chrome.downloads.cancel(active.downloadId).catch(() => {});
+    } else {
+      chrome.runtime.sendMessage({
+        target: 'offscreen',
+        action: 'cancelDownload',
+        url: request.url
+      }).catch(() => {});
+    }
+
     broadcast({ action: 'downloadError', url: request.url, error: 'Cancelled' });
     maybeCloseOffscreen();
     sendResponse({ success: true });
@@ -588,13 +740,22 @@ function broadcast(message) {
 }
 
 /**
- * Start video download process — delegated to the offscreen document,
- * which has the DOM APIs (Blob, URL.createObjectURL) the pipeline needs.
+ * Start a detected video using the pipeline appropriate to its format.
+ * HLS remains in the offscreen downloader; direct MP4s are handed to the
+ * browser downloads API and repaired after the file is fully written.
  */
 async function startDownload(url, filename, tabId) {
+  const stream = detectedStreams.get(url);
+  const format = getStreamFormat(stream || url);
+
+  if (format === 'mp4') {
+    return startDirectMp4Download(url, filename || 'video.mp4');
+  }
+
   // Register before the await so maybeCloseOffscreen() can't close
   // the document out from under a download that's about to start
   activeDownloads.set(url, {
+    kind: 'hls',
     progress: { percent: 0, downloaded: 0, total: 0 },
     startTime: Date.now()
   });
@@ -606,6 +767,67 @@ async function startDownload(url, filename, tabId) {
     url: url,
     filename: filename || 'video.mp4'
   }).catch((err) => console.error('[Offscreen] send failed:', err));
+}
+
+async function startDirectMp4Download(url, filename) {
+  activeDownloads.set(url, {
+    kind: 'direct',
+    progress: {
+      kind: 'direct',
+      phase: 'downloading',
+      percent: 0,
+      bytesReceived: 0,
+      totalBytes: 0,
+      mbDownloaded: '0.0'
+    },
+    startTime: Date.now(),
+    lastProgressAt: Date.now(),
+    downloadId: null
+  });
+
+  try {
+    const downloadId = await chrome.downloads.download({ url, filename });
+    const entry = {
+      streamUrl: url,
+      filename,
+      bytesReceived: 0,
+      totalBytes: 0,
+      startTime: Date.now()
+    };
+    directDownloads.set(downloadId, entry);
+    persistDirectDownloads();
+
+    const active = activeDownloads.get(url);
+    if (active) active.downloadId = downloadId;
+
+    // Pick up initial size/state immediately. Very small files may finish
+    // before their first onChanged event reaches this service worker.
+    const [item] = await chrome.downloads.search({ id: downloadId });
+    if (item) {
+      entry.bytesReceived = item.bytesReceived || 0;
+      entry.totalBytes = item.totalBytes || 0;
+
+      if (item.state === 'complete') {
+        completeDirectDownload(downloadId, entry);
+      } else if (item.state === 'interrupted') {
+        directDownloads.delete(downloadId);
+        activeDownloads.delete(url);
+        persistDirectDownloads();
+        throw new Error(item.error || 'MP4 download interrupted');
+      } else {
+        handleDirectDownloadDelta({
+          id: downloadId,
+          bytesReceived: { current: entry.bytesReceived },
+          totalBytes: { current: entry.totalBytes }
+        }, entry);
+      }
+    }
+
+    return downloadId;
+  } catch (error) {
+    activeDownloads.delete(url);
+    throw error;
+  }
 }
 
 async function ensureOffscreenDocument() {
