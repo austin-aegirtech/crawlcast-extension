@@ -1,833 +1,1736 @@
-# Miteruno — Technical Documentation
+# Crawlcast — Project Architecture & Developer Reference
 
-> **Running document.** Update the [Change Log](#13-change-log) whenever behaviour
-> changes, and keep [Known Limitations](#11-known-limitations--trade-offs) honest.
-> Last updated: 2026-08-04 · Extension version 1.0.0 (Himitsu)
+> **Repository snapshot documented:** `main` @ `9f7be54`  
+> **Manifest version:** `1.0.0`  
+> **Document regenerated:** 2026-09-18  
+> **Purpose:** authoritative technical reference for the current Crawlcast codebase.
 
----
+Crawlcast is a Chrome Manifest V3 browser extension that detects downloadable video requests made by the active page and handles two media paths:
 
-## Table of Contents
+1. **Direct MP4** — detected `.mp4` URLs are handed directly to Chrome's download manager.
+2. **HLS / M3U8** — detected `.m3u8` playlists are parsed, downloaded segment-by-segment, converted/assembled into MP4 in an offscreen document, then saved through Chrome.
 
-1. [What This Is](#1-what-this-is)
-2. [High-Level Architecture](#2-high-level-architecture)
-3. [Why It's Built This Way](#3-why-its-built-this-way)
-4. [File Map](#4-file-map)
-5. [Stream Detection](#5-stream-detection)
-6. [The Download Pipeline](#6-the-download-pipeline)
-7. [MP4 Container Internals](#7-mp4-container-internals)
-8. [Thumbnails & Previews](#8-thumbnails--previews)
-9. [The Native Host](#9-the-native-host)
-10. [Message Protocol Reference](#10-message-protocol-reference)
-11. [Known Limitations & Trade-offs](#11-known-limitations--trade-offs)
-12. [Testing Notes](#12-testing-notes)
-14. [Change Log](#13-change-log)
-14. [Future Work](#14-future-work)
+An optional native messaging host can inspect and repair downloaded MP4 files with FFmpeg/FFprobe. It is especially important for HLS output because the browser pipeline produces fragmented MP4.
+
+This file is intentionally developer-focused. `README.md` is the customer/developer-facing overview; `PROJECT.md` explains how the implementation actually works.
 
 ---
 
-## 1. What This Is
+## Table of contents
 
-Miteruno is a Chrome extension (Manifest V3) that detects **HLS video streams**
-on any web page and converts them into playable MP4 files entirely inside the
-browser — no server, no upload, no external service.
+1. [Current product state](#1-current-product-state)
+2. [Architecture at a glance](#2-architecture-at-a-glance)
+3. [Runtime contexts](#3-runtime-contexts)
+4. [Repository map](#4-repository-map)
+5. [Manifest and permissions](#5-manifest-and-permissions)
+6. [Media detection](#6-media-detection)
+7. [State and persistence](#7-state-and-persistence)
+8. [Popup UI](#8-popup-ui)
+9. [User Mode, God Mode, and Premium scaffolding](#9-user-mode-god-mode-and-premium-scaffolding)
+10. [Direct MP4 pipeline](#10-direct-mp4-pipeline)
+11. [HLS / M3U8 pipeline](#11-hls--m3u8-pipeline)
+12. [Playlist parsing](#12-playlist-parsing)
+13. [HLS segment downloading and retry behavior](#13-hls-segment-downloading-and-retry-behavior)
+14. [Transmuxing and MP4 assembly](#14-transmuxing-and-mp4-assembly)
+15. [Separate HLS audio](#15-separate-hls-audio)
+16. [Thumbnails and metadata](#16-thumbnails-and-metadata)
+17. [Native MP4 inspection and repair](#17-native-mp4-inspection-and-repair)
+18. [Cross-context message protocol](#18-cross-context-message-protocol)
+19. [Diagnostics and logging](#19-diagnostics-and-logging)
+20. [Cancellation and cleanup](#20-cancellation-and-cleanup)
+21. [Known limits and implementation gaps](#21-known-limits-and-implementation-gaps)
+22. [Unused / stale repository artifacts](#22-unused--stale-repository-artifacts)
+23. [Development workflow](#23-development-workflow)
+24. [Testing matrix](#24-testing-matrix)
+25. [Store / production readiness](#25-store--production-readiness)
+26. [Change-safety notes](#26-change-safety-notes)
 
-HLS (HTTP Live Streaming) doesn't ship a video as one file. It ships a *playlist*
-(`.m3u8`) listing hundreds or thousands of small `.ts` chunks, which the player
-fetches and stitches together on the fly. To produce a downloadable file you have
-to do the same work the player does, plus repackage the result into a container
-that offline players understand.
+---
 
-The extension does five distinct jobs:
+# 1. Current product state
 
-| Job | Where it runs |
+The current branch implements the following behavior.
+
+### Detection
+
+- Detects URLs containing `.m3u8` before the URL end, query string, or fragment.
+- Detects URLs containing `.mp4` before the URL end, query string, or fragment.
+- Associates a detected request with the originating Chrome tab.
+- Shows a per-tab badge count.
+- Keeps up to 50 detected stream entries in session storage.
+
+### Popup
+
+- Dark Crawlcast UI with separated `styles/popup.css`.
+- One card per detected stream.
+- `M3U8` / `MP4` badges.
+- Page-title-derived filenames.
+- Clickable title and pencil icon for editing the saved filename title.
+- HLS thumbnails with hover animation when preview generation succeeds.
+- Duration, estimated size, resolution, host, request type, and segment count when available.
+- Download progress and cancellation.
+- Final `Complete!` state after native inspection/repair succeeds.
+- Floating diagnostic log window.
+- Clear button for removing detected streams that are not actively healthy downloads.
+- No main Refresh button.
+
+### Free / Premium scaffolding
+
+- **User Mode is the default.**
+- User Mode allows one accepted download start per rolling 60-minute window.
+- A live purple countdown is shown inside the Premium panel after the free limit is hit.
+- **God Mode** bypasses the rate limit and currently exists for development/testing.
+- Premium billing/account entitlement is not implemented yet.
+- The Premium CTA currently reports that Premium is coming soon.
+
+### Downloads
+
+- Direct MP4 uses `chrome.downloads` directly.
+- HLS downloads run through the offscreen document.
+- HLS automatically selects the highest-bandwidth variant.
+- HLS segment fetch concurrency is currently `2`.
+- Temporary `429/500/502/503/504` failures retry with exponential backoff, jitter, `Retry-After` support, and a shared cooldown.
+- A segment that exhausts retries fails the whole HLS download instead of being silently skipped.
+- In-browser HLS assembly is guarded at approximately **1.5 GB estimated media size**.
+
+### MP4 finalization
+
+- HLS output is sent through the native repair path when the host is available.
+- Direct MP4 files are inspected first.
+- Already-normal direct MP4 files skip FFmpeg entirely.
+- Fragmented or non-faststart MP4 files are remuxed with `-c copy -movflags +faststart`.
+- Separate HLS audio can be merged during the same native FFmpeg pass.
+
+---
+
+# 2. Architecture at a glance
+
+```mermaid
+flowchart TD
+    PAGE[Web page / video player]
+    WEBREQ[Chrome webRequest]
+    BG[background.js\nMV3 service worker]
+    STORE[(Chrome storage)]
+    POPUP[popup.html + popup.js\nstyles/popup.css]
+    OFF[offscreen.html + offscreen.js]
+    PARSER[m3u8-parser.js]
+    DL[downloader.js]
+    MUX[lib/mux.min.js]
+    CHROME_DL[chrome.downloads]
+    NATIVE[crawlcast_host.py\nNative Messaging]
+    FFMPEG[FFmpeg / FFprobe]
+    FILE[Saved MP4]
+
+    PAGE --> WEBREQ --> BG
+    BG <--> STORE
+    POPUP <--> BG
+
+    BG -->|direct .mp4| CHROME_DL
+
+    BG -->|HLS .m3u8| OFF
+    OFF --> PARSER
+    OFF --> DL
+    DL --> PARSER
+    DL --> MUX
+    OFF -->|Blob URL| BG
+    BG --> CHROME_DL
+
+    CHROME_DL --> FILE
+    BG -->|inspect / remux| NATIVE
+    NATIVE --> FFMPEG
+    FFMPEG --> FILE
+    NATIVE --> BG
+    BG --> POPUP
+```
+
+The central architectural rule is:
+
+> **`background.js` owns browser-level coordination; `offscreen.js` owns DOM/media work; `crawlcast_host.py` owns local filesystem/FFmpeg work.**
+
+The popup is a view/controller. It is not authoritative state because it is destroyed whenever the popup closes.
+
+---
+
+# 3. Runtime contexts
+
+Crawlcast spans four runtime environments.
+
+## 3.1 MV3 service worker — `background.js`
+
+The service worker is the central broker.
+
+It owns or coordinates:
+
+- media request detection;
+- detected stream registry;
+- browser toolbar badge state;
+- User Mode rate limiting;
+- direct MP4 downloads;
+- HLS download startup;
+- download progress bookkeeping;
+- Chrome Downloads API operations;
+- Blob URL lifecycle coordination;
+- thumbnail job coordination;
+- diagnostics log storage;
+- native messaging connection;
+- MP4 inspection/remux state;
+- separate-audio merge handoff.
+
+The worker has no normal page DOM. It therefore cannot perform the HLS preview and Blob-oriented media work directly.
+
+## 3.2 Popup — `popup.html`, `popup.js`, `styles/popup.css`
+
+The popup is recreated every time the browser action UI opens.
+
+It is responsible for:
+
+- querying the active tab;
+- requesting current streams from the service worker;
+- rendering stream cards;
+- collecting title edits;
+- constructing safe output filenames;
+- displaying User/God mode;
+- displaying the User Mode cooldown;
+- starting/cancelling downloads;
+- showing download progress;
+- showing repair/finalization status;
+- showing floating logs;
+- presenting the Premium stub.
+
+It does **not** own durable download state.
+
+## 3.3 Offscreen document — `offscreen.html`, `offscreen.js`
+
+The offscreen document exists because MV3 service workers do not provide the DOM/media APIs needed by this pipeline.
+
+It hosts:
+
+- `mux.js`;
+- `M3U8Parser`;
+- `VideoDownloader`;
+- `Blob` creation;
+- `URL.createObjectURL()`;
+- `<video>` decoding;
+- `<canvas>` thumbnail capture;
+- HLS segment downloading/transmux orchestration.
+
+It is created on demand and closed when no HLS download, pending Blob, or thumbnail job needs it.
+
+## 3.4 Native host — `native-host/crawlcast_host.py`
+
+The native host is a local process outside Chrome.
+
+It communicates with Chrome using the Native Messaging length-prefixed JSON protocol over stdin/stdout.
+
+It currently supports two actions:
+
+- `inspect` — quickly classify MP4 container structure without reading the full media payload;
+- `remux` — run FFmpeg stream-copy repair and optionally merge a separate audio file.
+
+The host is optional for basic download saving, but important for final HLS compatibility and separate-audio merging.
+
+---
+
+# 4. Repository map
+
+```text
+crawlcast-extension/
+├── manifest.json
+├── background.js
+├── popup.html
+├── popup.js
+├── styles/
+│   └── popup.css
+├── offscreen.html
+├── offscreen.js
+├── downloader.js
+├── m3u8-parser.js
+├── auth.js
+├── lib/
+│   ├── mux.min.js
+│   └── StreamSaver.min.js
+├── icons/
+│   ├── icon16.png
+│   ├── icon48.png
+│   ├── icon128.png
+│   └── download_icon.png
+├── native-host/
+│   ├── crawlcast_host.py
+│   ├── crawlcast_host.bat
+│   ├── com.crawlcast.downloader.json
+│   ├── register-native-host.ps1
+│   ├── register-native-host.sh
+│   ├── register-native-host-from-wsl.sh
+│   └── README.md
+├── tools/
+│   ├── remux.sh
+│   └── Repair-Videos.ps1
+├── README.md
+└── PROJECT.md
+```
+
+## File responsibilities
+
+| File | Current responsibility |
 |---|---|
-| Notice `.m3u8` requests as pages load | Service worker |
-| Estimate size + generate animated previews | Offscreen document |
-| Download + transmux segments into an MP4 | Offscreen document |
-| Repair the saved file so it seeks properly | Native messaging host |
-| Hand large/unsupported videos to an external tool | Native messaging host |
-
-Only the first three are self-contained. The native host requires a one-time
-local install; without it, downloads still work but stay fragmented.
-
----
-
-## 2. High-Level Architecture
-
-MV3 extensions are split across several isolated JavaScript contexts that cannot
-call each other directly; everything happens by message passing.
-
-```
-┌─────────────────┐                         ┌──────────────────────┐
-│     popup.js    │  getStreams             │    background.js     │
-│  (popup.html)   │ ──────────────────────► │  (service worker)    │
-│                 │ ◄────────────────────── │                      │
-│  • stream list  │  streams + downloading   │  • webRequest hook   │
-│  • thumbnails   │                          │  • stream registry   │
-│  • progress UI  │  downloadProgress        │  • message broker    │
-│  • external box │ ◄────────────────────── │  • chrome.downloads  │
-└─────────────────┘                          └──────────┬───────────┘
-                                                        │
-                            ┌───────────────────────────┼─────────────────┐
-                            │ downloadStream            │ connectNative   │
-                            ▼                           ▼                 │
-                 ┌─────────────────────┐    ┌───────────────────────┐     │
-                 │    offscreen.js     │    │  miteruno_host.py     │     │
-                 │  (offscreen.html)   │    │  (native host)        │     │
-                 │                     │    │                       │     │
-                 │  • VideoDownloader  │    │  • spawns yt-dlp      │     │
-                 │  • M3U8Parser       │    │  • runs ffmpeg remux  │     │
-                 │  • mux.js transmux  │    │  • relays progress    │     │
-                 │  • <video>+<canvas> │    └───────────────────────┘     │
-                 │  • Blob assembly    │ ── saveBlob ─────────────────────┘
-                 └─────────────────────┘
-```
-
-The full lifecycle of one HLS download touches every context:
-
-```
-detect (worker) → list (popup) → analyze: size + preview (offscreen)
-   → download + transmux (offscreen) → save (worker, chrome.downloads)
-      → remux (native host) → "Saved and repaired" (popup)
-```
-
-### The four contexts and why each exists
-
-**Popup** (`popup.html` + `popup.js`) — the UI. Destroyed every time it closes,
-so it holds no authoritative state; it re-queries the service worker on open.
-
-**Service worker** (`background.js`) — the only context that can use
-`chrome.webRequest` and `chrome.downloads`. Owns the stream registry and brokers
-every message. Chrome suspends it after ~30 s idle, so its memory is *not*
-durable — see [§5](#5-stream-detection).
-
-**Offscreen document** (`offscreen.html` + `offscreen.js`) — a hidden page that
-exists purely to provide DOM APIs the service worker lacks: `Blob`,
-`URL.createObjectURL`, `<video>`, `<canvas>`. All heavy lifting happens here.
-Created on demand, destroyed when idle.
-
-**Native host** (`miteruno_host.py`) — a local process outside the browser
-entirely, reached over stdio. Handles cases the in-browser pipeline can't.
+| `manifest.json` | MV3 metadata, permissions, service-worker entry point, popup, icons. |
+| `background.js` | Main coordinator: detection, storage, User Mode limit, direct MP4, HLS orchestration, browser downloads, logs, native host. |
+| `popup.html` | Popup markup only. Styling lives outside the HTML. |
+| `styles/popup.css` | All popup presentation/layout styling. |
+| `popup.js` | Popup rendering, editable titles, filename generation, mode UI, countdown, progress, logs, controls. |
+| `offscreen.html` | Hidden extension document that loads mux.js, parser, downloader, and offscreen glue. |
+| `offscreen.js` | HLS job orchestration, thumbnail/metadata work, Blob URL creation, progress/error relay. |
+| `downloader.js` | `VideoDownloader`: HLS fetching, retries, variant handling, TS/fMP4 processing, audio rendition download, Blob preparation. |
+| `m3u8-parser.js` | HLS master/media parser, URL resolution, variant/audio selection. |
+| `lib/mux.min.js` | Runtime dependency used to transmux MPEG-TS into fragmented MP4. |
+| `native-host/crawlcast_host.py` | MP4 inspection, FFmpeg stream-copy repair, optional audio merge, duration verification. |
+| `native-host/crawlcast_host.bat` | Windows launcher for the Python native host. |
+| `native-host/com.crawlcast.downloader.json` | Chrome Native Messaging host manifest. |
+| `native-host/register-native-host.ps1` | Updates allowed extension ID and registers host in Windows registry. |
+| `native-host/register-native-host-from-wsl.sh` | WSL helper that invokes the PowerShell registration script. |
+| `tools/remux.sh` | Standalone batch/remux helper, outside the extension runtime. |
+| `tools/Repair-Videos.ps1` | Standalone PowerShell video repair/scan helper, outside the extension runtime. |
+| `auth.js` | Legacy/stub auth code. Not loaded or referenced by the current extension runtime. |
+| `lib/StreamSaver.min.js` | Checked-in legacy library. Not loaded or referenced by the current runtime. |
 
 ---
 
-## 3. Why It's Built This Way
+# 5. Manifest and permissions
 
-Three constraints drove nearly every architectural decision.
+Current `manifest.json`:
 
-**A service worker has no DOM.** The original code called
-`streamSaver.createWriteStream()` from `background.js`. StreamSaver builds hidden
-`<iframe>`s to stream data to disk — impossible without a document. That is why
-the offscreen document exists. The same constraint rules out `<video>`/`<canvas>`
-thumbnail capture in the worker.
+```json
+{
+  "manifest_version": 3,
+  "name": "Crawlcast",
+  "version": "1.0.0",
+  "description": "Crawling..",
+  "permissions": [
+    "webRequest",
+    "storage",
+    "activeTab",
+    "downloads",
+    "offscreen",
+    "nativeMessaging"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ]
+}
+```
 
-**A service worker is not durable.** Chrome terminates it after roughly 30 s of
-inactivity and restarts it on the next event, with all module-level state reset.
-An in-memory `Map` of detected streams silently empties. Hence
-`chrome.storage.session` persistence.
+## Permission purpose
 
-**Everything is buffered in memory.** Without streaming-to-disk, the whole video
-accumulates as `Uint8Array` chunks and is then copied into a `Blob` — peak usage
-roughly 2× the video size inside a single renderer process. This is the hard
-ceiling that motivates both the size guard and the external bridge.
-
----
-
-## 4. File Map
-
-Line counts as of v1.0.0 (Himitsu).
-
-**Extension core**
-
-| File | Lines | Role |
-|---|---:|---|
-| `manifest.json` | 36 | Permissions, entry points |
-| `background.js` | 517 | Service worker: detection, registry, message broker, remux trigger |
-| `popup.html` | 361 | UI markup + all CSS |
-| `popup.js` | 456 | UI logic, rendering, hover animation |
-| `offscreen.js` | 291 | Download orchestration, thumbnail generation |
-| `offscreen.html` | 12 | Loads mux.js, parser, downloader, glue |
-| `downloader.js` | 476 | `VideoDownloader` — fetch, transmux, assemble |
-| `m3u8-parser.js` | 196 | `M3U8Parser` — playlist parsing |
-| `lib/mux.min.js` | — | mux.js 7.1.0 (TS→MP4 transmuxer) |
-
-
-**Companion components** (all optional — the extension works without them)
-
-| File | Lines | Role |
-|---|---:|---|
-| `native-host/miteruno_host.py` | 285 | Native host: external downloads **and** post-download remux |
-| `native-host/miteruno_host.bat` | 5 | Windows launcher (Chrome can't exec `.py`) |
-| `native-host/com.miteruno.downloader.json` | 9 | Native host manifest |
-| `tools/remux.sh` | 252 | Batch-repair existing files (bash) |
-| `tools/Repair-Videos.ps1` | 320 | Batch-repair + damage scan (PowerShell) |
-| `PROJECT.md` | — | This document |
-
-### Permissions and why each is needed
-
-| Permission | Reason |
+| Permission | Why Crawlcast currently needs it |
 |---|---|
-| `webRequest` | Observe network requests to spot `.m3u8` URLs |
-| `storage` | `storage.session` for streams/logs; `storage.local` for mode/limit state |
-| `activeTab` | Resolve the current tab so streams are scoped per-tab |
-| `downloads` | Save the finished Blob to disk |
-| `offscreen` | Create the hidden document that hosts the pipeline |
-| `nativeMessaging` | Talk to the local downloader bridge |
-| `<all_urls>` | Streams can live on any host; segments too |
+| `webRequest` | Observe outgoing browser requests and detect `.m3u8` / `.mp4`. |
+| `storage` | Persist stream/session data, logs, direct-download restoration state, and local mode/cooldown state. |
+| `activeTab` | Read active-tab information such as title and scope popup results to the current tab. |
+| `downloads` | Save direct MP4 files and HLS-generated Blob URLs; monitor download completion/cancellation. |
+| `offscreen` | Run DOM-capable HLS/media work unavailable to a service worker. |
+| `nativeMessaging` | Talk to the local MP4 inspection/repair host. |
+| `<all_urls>` | Detect media and fetch playlists/segments from arbitrary web origins. |
+
+### Release note
+
+The actual uploaded snapshot still contains:
+
+- `"description": "Crawling.."`
+- `"host_permissions": ["<all_urls>"]`
+
+Those are the current code facts, even though a narrower `http://*/*` + `https://*/*` permission set and a production description have already been discussed for store readiness.
 
 ---
 
-## 5. Stream Detection
+# 6. Media detection
 
-### High level
-
-The service worker watches every network request the browser makes. Any URL
-ending in `.m3u8` (optionally followed by a query string) is recorded against the
-tab that requested it, the toolbar badge updates, and the popup can list it.
-
-### Low level
+Detection is entirely in `background.js`.
 
 ```js
-const M3U8_PATTERN = /\.m3u8($|\?)/i;
-
-chrome.webRequest.onBeforeRequest.addListener(
-  (details) => { /* record details.url, details.tabId, details.type */ },
-  { urls: ["<all_urls>"] },
-  ["requestBody"]
-);
+const M3U8_PATTERN = /\.m3u8(?:$|[?#])/i;
+const MP4_PATTERN = /\.mp4(?:$|[?#])/i;
 ```
 
-Each entry is `{ url, timestamp, tabId, type, initiator, title }`. The registry
-is capped at 50 entries (oldest evicted first) to bound memory.
+A `chrome.webRequest.onBeforeRequest` listener receives requests matching `<all_urls>` and calls `getStreamFormat(url)`.
 
-### Surviving worker suspension
-
-Because the worker's memory resets, every mutation is mirrored to
-`chrome.storage.session`:
+A detected entry has the current shape:
 
 ```js
-const streamsRestored = chrome.storage.session.get('detectedStreams').then(...)
+{
+  url,
+  timestamp,
+  tabId,
+  type,
+  initiator,
+  format,   // "m3u8" | "mp4"
+  title     // null until user edits it; popup otherwise uses page title
+}
 ```
 
-`streamsRestored` is a promise created at module load. Every handler that reads
-the registry awaits it first, guaranteeing restoration has completed before a
-response is sent. `storage.session` is the right store here: it survives worker
-restarts but clears when the browser closes, so stale streams don't accumulate
-forever.
+The map is keyed by URL:
 
-> **Gotcha we hit:** requests made by a *site's own* service worker report
-> `tabId: -1` and get filtered out of the per-tab view. If a stream is detected
-> in the worker console but never appears in the popup, this is why.
+```js
+const detectedStreams = new Map();
+```
 
-### What this cannot detect
+### Important behavior
 
-Only literal `.m3u8` URLs. Not DASH (`.mpd`), not progressive MP4, not blob/MSE
-sources, not DRM-protected streams, and not YouTube VOD — see
-[§12](#12-known-limitations--trade-offs).
+- Duplicate URLs are ignored globally with `detectedStreams.has(url)`.
+- The registry is capped at 50 entries.
+- The oldest map entry is evicted after the cap is exceeded.
+- The current tab's count is shown on the extension badge.
+- Stream state is mirrored to `chrome.storage.session`.
+
+### Consequence of URL-keyed storage
+
+If the exact same media URL appears in two different tabs, only the first stored entry exists because URL is the map key. This can prevent the same URL from appearing independently under the second tab.
 
 ---
 
-## 6. The Download Pipeline
+# 7. State and persistence
 
-### High level
+Crawlcast intentionally mixes in-memory state with Chrome storage.
 
-Pick the best-quality variant → download every segment → convert each from
-MPEG-TS to MP4 fragments → concatenate → patch the header → save.
+## 7.1 `chrome.storage.session`
 
-### Step by step
+Session storage survives service-worker suspension/restart but is cleared when the browser session ends.
 
-```
-popup: startDownload
-  → background: ensureOffscreenDocument(), register in activeDownloads
-    → offscreen: new VideoDownloader().download(url, filename)
-       1. fetchPlaylist(m3u8Url)          → M3U8Parser.parse()
-       2. if master → selectBestVariant() → fetchPlaylist(variant.url)
-       2b. estimateSize() → abort if > memoryLimitBytes
-       3. initializeTransmuxer()          → muxjs.mp4.Transmuxer
-       4. chunks[] + writer shim
-       5. downloadSegments()              → sliding window, ordered writes
-       6. patchInitSegmentDuration() → new Blob(chunks)
-    → background: chrome.downloads.download(blobUrl)
-       → revoke blob URL on completion → maybeCloseOffscreen()
-```
+### `detectedStreams`
 
-### 6.1 Playlist parsing (`m3u8-parser.js`)
-
-An `.m3u8` file is line-based. Two kinds matter:
-
-**Master playlist** — lists quality variants:
-```
-#EXT-X-STREAM-INF:BANDWIDTH=2500000,RESOLUTION=1920x1080
-1080p/index.m3u8
-```
-
-**Media playlist** — lists actual segments:
-```
-#EXTINF:4.000,
-segment0001.ts
-```
-
-The parser walks lines, tracking whether the previous line was an `#EXT-X-STREAM-INF`
-(→ next non-comment line is a variant URL) or an `#EXTINF` (→ next non-comment
-line is a segment URL). `resolveUrl()` handles absolute, protocol-relative,
-root-relative, and relative paths against the playlist's own URL.
-
-> **Bug fixed here:** the master-variant branch ran before the segment branch and
-> didn't check `currentVariant !== null`, so parsing a *media* playlist crashed
-> with `Cannot set properties of null (setting 'url')`. This was the original
-> "download does nothing" failure.
-
-### 6.2 Segment fetching — parallel fetch, ordered processing
-
-The naive approaches both fail:
-
-- Fully serial → network idles during transmuxing; very slow.
-- Fully parallel → segments reach the shared transmuxer out of order, producing
-  interleaved, corrupt MP4 fragments.
-
-The solution decouples the two phases. A **sliding window** of up to
-`concurrency` (4) fetches runs ahead, while consumption is strictly sequential:
+Serialized form of:
 
 ```js
-for (let i = 0; i < segments.length; i++) {
-  // top up the window
-  for (let j = i; j < Math.min(i + this.concurrency, segments.length); j++) {
-    if (!pending.has(j)) pending.set(j, this.fetchSegmentWithRetry(segments[j], j));
+Array.from(detectedStreams.entries())
+```
+
+Used to restore detected cards after a service-worker restart.
+
+### `directDownloads`
+
+Serialized direct-download tracking:
+
+```js
+Array.from(directDownloads.entries())
+```
+
+This lets a direct MP4 browser download survive a service-worker restart and rehydrate `activeDownloads` from `chrome.downloads.search()`.
+
+### `logs`
+
+Up to 400 centralized diagnostic log entries.
+
+## 7.2 `chrome.storage.local`
+
+Persists across browser restarts.
+
+### `crawlcastMode`
+
+Current value:
+
+```text
+user | god
+```
+
+Invalid/missing values fall back to `user`.
+
+### `userModeLastDownloadAt`
+
+Timestamp of the last accepted User Mode download start.
+
+The next allowed start is:
+
+```text
+userModeLastDownloadAt + 60 minutes
+```
+
+## 7.3 Important in-memory-only maps/sets
+
+These are **not** fully persisted:
+
+- `activeDownloads`
+- `pendingBlobUrls`
+- `pendingAudioMerge`
+- `thumbnailJobs`
+- popup `activeDownloadsUI`
+- popup `completedDownloadsUI`
+- popup `thumbFrames`
+
+Direct MP4 downloads have explicit restoration logic; HLS active-download bookkeeping does not have equivalent full persistence.
+
+---
+
+# 8. Popup UI
+
+The popup is split cleanly into three files:
+
+```text
+popup.html
+popup.js
+styles/popup.css
+```
+
+There is no intentionally embedded popup CSS inside the HTML or JavaScript.
+
+## 8.1 Header
+
+Contains:
+
+- Crawlcast brand/icon;
+- User/God mode toggle;
+- detected-stream count.
+
+## 8.2 Premium panel
+
+Contains:
+
+- Premium heading;
+- Premium description;
+- free-limit countdown region;
+- `Get Premium` button;
+- dismiss/close control;
+- coming-soon status.
+
+The Premium button is currently a stub and does not perform billing.
+
+## 8.3 Stream card
+
+A card can contain:
+
+- thumbnail or placeholder;
+- duration badge;
+- `M3U8` / `MP4` format badge;
+- request-type badge;
+- editable title;
+- host;
+- detection age;
+- size/duration/resolution/segment metadata;
+- raw media URL;
+- Cancel button when active;
+- Download / Downloading… / Complete! button;
+- progress bar;
+- status message.
+
+## 8.4 Editable titles
+
+The title can be edited by:
+
+- clicking the title; or
+- clicking the pencil control.
+
+Behavior:
+
+- `Enter` commits through blur;
+- blur saves;
+- `Esc` cancels;
+- `setStreamTitle` persists the title on the detected stream;
+- titles are locked while a card is downloading or complete.
+
+The filename is generated from the current card title and sanitized for filesystem safety.
+
+### Filename sanitation
+
+`buildDownloadFilename()`:
+
+- removes an existing common video extension;
+- replaces Windows-invalid characters and control characters;
+- collapses whitespace;
+- removes trailing dots/spaces;
+- protects Windows reserved names (`CON`, `PRN`, etc.);
+- truncates the basename to 180 characters;
+- falls back to `video_<timestamp>.mp4`.
+
+## 8.5 Bottom toolbar
+
+Current bottom toolbar actions:
+
+- **Logs**
+- **Clear**
+
+The old main Refresh button has been intentionally removed.
+
+---
+
+# 9. User Mode, God Mode, and Premium scaffolding
+
+Rate limiting is enforced in `background.js`, not merely in the popup.
+
+That matters because closing/reopening the popup must not bypass the free-tier limit.
+
+```js
+const USER_MODE_DOWNLOAD_LIMIT_MS = 60 * 60 * 1000;
+let crawlcastMode = 'user';
+```
+
+## User Mode
+
+- Default mode.
+- One accepted download start per rolling hour.
+- The slot is consumed when `background.js` accepts the start request.
+- If the pipeline cannot even start, the slot is returned.
+- Later network/download failures still count as the consumed attempt.
+
+## God Mode
+
+- Bypasses the time limit.
+- Exists as a development/testing tool.
+- Intended to be removed from the public production UI before store release.
+
+## Countdown
+
+`popup.js` receives `nextAllowedAt` from the background worker and runs a one-second UI timer.
+
+When limited:
+
+- idle download buttons are disabled;
+- the Premium panel displays the purple countdown;
+- the mode-toggle tooltip reports remaining time.
+
+At expiry:
+
+- countdown hides;
+- idle download buttons re-enable automatically;
+- no popup refresh is required.
+
+## Premium
+
+The current Premium UI is only product scaffolding.
+
+Not implemented yet:
+
+- payment provider integration;
+- customer accounts;
+- subscription creation;
+- entitlement lookup;
+- Premium feature unlocks;
+- restore purchase/sign-in flow.
+
+---
+
+# 10. Direct MP4 pipeline
+
+Direct `.mp4` requests do **not** go through the HLS downloader.
+
+```mermaid
+sequenceDiagram
+    participant Page
+    participant BG as background.js
+    participant Popup
+    participant CD as chrome.downloads
+    participant NH as Native Host
+
+    Page->>BG: request *.mp4
+    BG->>BG: store detected stream
+    Popup->>BG: startDownload(url, filename)
+    BG->>CD: chrome.downloads.download(url)
+    CD-->>BG: byte/state updates
+    BG-->>Popup: downloadProgress
+    CD-->>BG: complete
+    BG-->>Popup: downloadComplete
+    BG->>NH: inspect(saved path)
+    alt already optimized
+        NH-->>BG: inspection needsRemux=false
+        BG-->>Popup: remuxComplete(alreadyOptimized)
+    else needs repair
+        NH-->>BG: inspection needsRemux=true
+        BG-->>Popup: remuxStarted
+        BG->>NH: remux(saved path)
+        NH-->>BG: remuxed
+        BG-->>Popup: remuxComplete
+    end
+```
+
+## 10.1 Start
+
+`startDownload()` dispatches by format:
+
+```js
+if (format === 'mp4') {
+  return startDirectMp4Download(url, filename || 'video.mp4');
+}
+```
+
+## 10.2 Browser-managed download
+
+`startDirectMp4Download()` calls:
+
+```js
+chrome.downloads.download({ url, filename })
+```
+
+This avoids the HLS in-memory Blob limit.
+
+## 10.3 Progress
+
+`chrome.downloads.onChanged` updates:
+
+- `bytesReceived`;
+- `totalBytes`;
+- calculated percent;
+- popup status.
+
+If total size is not known, popup progress becomes indeterminate and shows bytes received.
+
+## 10.4 Service-worker restart handling
+
+Direct download mappings are persisted in `chrome.storage.session`.
+
+On restore, Crawlcast:
+
+1. reloads download ID → stream mapping;
+2. calls `chrome.downloads.search()`;
+3. reconstructs active direct-download state;
+4. immediately finishes or drops interrupted entries when appropriate.
+
+## 10.5 Completion
+
+On browser completion:
+
+1. popup receives `downloadComplete`;
+2. UI changes to **Checking MP4 file…**;
+3. native host inspects the file when available;
+4. already-optimized files skip FFmpeg;
+5. unhealthy container layout runs stream-copy remux;
+6. popup reaches **Complete** / **Complete!** after `remuxComplete`.
+
+---
+
+# 11. HLS / M3U8 pipeline
+
+HLS is substantially more complex than direct MP4.
+
+```mermaid
+sequenceDiagram
+    participant Popup
+    participant BG as background.js
+    participant OFF as offscreen.js
+    participant P as M3U8Parser
+    participant D as VideoDownloader
+    participant M as mux.js
+    participant CD as chrome.downloads
+    participant NH as Native Host
+
+    Popup->>BG: startDownload(.m3u8)
+    BG->>OFF: downloadStream
+    OFF->>D: download(url, filename)
+    D->>P: parse master/media playlist
+    D->>D: select highest bandwidth variant
+    D->>D: estimate size / enforce 1.5 GB guard
+    loop media segments
+        D->>D: fetch with retry/backoff
+        alt MPEG-TS
+            D->>M: transmux TS → fMP4
+        else fMP4/CMAF
+            D->>D: prepend EXT-X-MAP init segment when needed
+        end
+        D-->>OFF: progress callback
+        OFF-->>BG: downloadProgress
+        BG-->>Popup: downloadProgress
+    end
+    D->>D: patch init-segment durations
+    D-->>OFF: Blob + optional audio Blob
+    OFF-->>BG: saveBlob
+    BG->>CD: save video/audio
+    CD-->>BG: complete
+    BG->>NH: remux / merge + faststart
+    NH-->>BG: remuxed
+    BG-->>Popup: remuxComplete
+```
+
+## HLS stages
+
+1. Fetch playlist.
+2. Parse playlist.
+3. If master: choose highest-bandwidth video variant.
+4. Detect referenced separate audio rendition.
+5. Fetch selected media playlist.
+6. Estimate size.
+7. Abort before heavy work when estimate exceeds memory guard.
+8. Initialize mux.js transmuxer.
+9. Fetch segments with a two-request sliding window.
+10. Consume/transmux strictly in playlist order.
+11. Patch duration fields into initial MP4 metadata.
+12. Assemble in-memory `Blob`.
+13. Download separate audio rendition if required.
+14. Create Blob URL(s) in offscreen document.
+15. Ask background worker to save via `chrome.downloads`.
+16. Run native repair/merge when available.
+
+---
+
+# 12. Playlist parsing
+
+`m3u8-parser.js` exposes `M3U8Parser`.
+
+## Parsed structures
+
+A parsed playlist currently contains:
+
+```js
+{
+  isMaster,
+  variants,
+  media,
+  segments,
+  initSegmentUrl,
+  metadata: {
+    targetDuration,
+    mediaSequence,
+    version
   }
-  const arrayBuffer = await pending.get(i);   // consume in playlist order
-  pending.delete(i);
-  if (arrayBuffer === null) continue;          // failed → skip, keep going
-  ...transmux, write...
 }
 ```
 
-Fetching is the slow part, so this recovers most of the parallel speedup with
-none of the ordering risk.
+## Supported tags / concepts
 
-**Retry and timeout.** `fetchSegmentWithRetry` makes up to 20 attempts with
-linear backoff (`1000ms × attempt` — 1 s, 2 s, 3 s, ... up to 20 s). Each
-attempt gets its own 30 s timeout, combined with the user-cancel signal via
-`AbortSignal.any()`:
+### `#EXT-X-STREAM-INF`
+
+Creates quality variants with:
+
+- bandwidth;
+- resolution;
+- codecs;
+- frame rate;
+- linked audio group.
+
+### `#EXT-X-MEDIA`
+
+Captures alternate media entries including:
+
+- type;
+- group ID;
+- name;
+- language;
+- default/autoselect/forced flags;
+- channel count;
+- URI.
+
+Current runtime selection logic uses this for **audio renditions**.
+
+### `#EXT-X-MAP`
+
+Captures a playlist-level init segment for fMP4/CMAF media.
+
+Current implementation stores the most recent `initSegmentUrl` globally for the parsed playlist; it does not track multiple maps per discontinuity/segment group.
+
+### `#EXTINF`
+
+Captures segment duration and associates the next non-comment line as the segment URL.
+
+### Playlist metadata
+
+Reads:
+
+- `#EXT-X-TARGETDURATION`
+- `#EXT-X-MEDIA-SEQUENCE`
+- `#EXT-X-VERSION`
+- `#EXT-X-DISCONTINUITY`
+
+## URL resolution
+
+Supports:
+
+- absolute HTTP(S);
+- protocol-relative URLs;
+- root-relative paths;
+- playlist-relative paths.
+
+## Variant selection
+
+Current behavior is fixed:
 
 ```js
-const timeoutController = new AbortController();
-const timer = setTimeout(() => timeoutController.abort(), this.segmentTimeoutMs);
-const signal = AbortSignal.any([this.abortController.signal, timeoutController.signal]);
-```
-
-> **Why this matters:** without a timeout, a server that accepts the connection
-> but never responds leaves `await fetch()` pending forever. It never rejects, so
-> retry never fires, and the entire download freezes silently. This is exactly
-> what stalled a real download at segment 4127/4130 for 21 minutes.
-
-### 6.3 Transmuxing (TS → MP4)
-
-HLS segments are usually MPEG-TS — a broadcast format with 188-byte packets,
-detected by sync byte `0x47` at offsets 0 and 188:
-
-```js
-isTransportStream(buffer) {
-  const view = new Uint8Array(buffer);
-  return view[0] === 0x47 && view[188] === 0x47;
+selectBestVariant(variants) {
+  return variants.sort((a, b) => b.bandwidth - a.bandwidth)[0];
 }
 ```
 
-TS is not playable by consumer players, so each segment is **transmuxed** — the
-audio/video elementary streams are re-wrapped into MP4 boxes without re-encoding.
-No quality loss, and it's fast (no decode/encode cycle). `mux.js` does the work;
-`transmuxSegment()` wraps its event-based API in a promise, attaching one-shot
-`data`/`done` handlers per segment and concatenating the output.
-
-The first segment additionally emits an **init segment** (`ftyp` + `moov`) which
-must be written before any media data.
-
-### 6.4 Assembly and saving
-
-Transmuxed fragments accumulate in a `chunks[]` array behind a minimal writer
-shim (a leftover seam from the StreamSaver design — kept because it keeps
-`downloadSegments()` agnostic about the destination). At the end:
-
-1. `patchInitSegmentDuration(chunks[0], totalDuration)` — see [§7](#7-mp4-container-internals)
-2. `new Blob(chunks, { type: 'video/mp4' })`
-3. `chunks.length = 0` — release the duplicate buffers
-4. Offscreen creates a blob URL and posts `saveBlob` to the background
-5. Background calls `chrome.downloads.download()` (offscreen documents can't)
-6. On `downloads.onChanged` complete/interrupted → tell offscreen to
-   `URL.revokeObjectURL()` → `maybeCloseOffscreen()`
-
-### 6.5 Size guard
-
-Before downloading, `estimateSize()` computes `bandwidth / 8 × duration` (or a
-per-segment average when there's no master playlist). Above
-`memoryLimitBytes` (1.5 GB) the download is refused with a `tooLarge` error, and
-the popup offers a one-click handoff to the external downloader.
-
-### 6.6 Cancellation and stall recovery
-
-- Each `VideoDownloader` holds an `AbortController`; `cancel()` aborts it.
-- Offscreen keeps `runningDownloads: Map<url, VideoDownloader>` so cancel
-  requests can reach the right instance.
-- Background *also* removes its own tracking immediately, so a crashed offscreen
-  document can never permanently lock the UI.
-- Background records `lastProgressAt` on every progress message. **Clear**
-  force-releases any download with no progress for `STALE_DOWNLOAD_MS` (2 min).
+There is currently no user-facing quality selector.
 
 ---
 
-## 7. MP4 Container Internals
+# 13. HLS segment downloading and retry behavior
 
-This section explains the single most consequential design constraint in the
-project. It is worth understanding in full.
+`downloader.js` currently uses:
 
-### Two kinds of MP4
-
-**Regular (progressive) MP4:**
+```js
+this.concurrency = 2;
+this.maxSegmentAttempts = 20;
+this.maxRetryDelayMs = 15000;
+this.segmentTimeoutMs = 30000;
+this.retryableHttpStatuses = new Set([429, 500, 502, 503, 504]);
 ```
-ftyp | moov (complete sample tables) | mdat (all media data)
+
+## 13.1 Fetch concurrency
+
+Two segment fetches can be in flight, but processing is kept in playlist order.
+
+Why:
+
+- fully serial fetches waste network time;
+- fully parallel processing can corrupt output because the shared transmuxer must receive segments in order.
+
+The sliding-window design fetches ahead but awaits each segment by index before transmuxing/writing it.
+
+## 13.2 Retry policy
+
+Temporary failures use:
+
+- exponential backoff;
+- ± jitter;
+- 15-second cap for Crawlcast's own calculated delay;
+- server `Retry-After` when present;
+- shared `retryPauseUntil` across the downloader.
+
+The shared pause is important: if one request receives a CDN `503`, the other pending work does not continue hammering the server at full speed.
+
+## 13.3 Timeout
+
+Every segment attempt gets a 30-second timeout.
+
+When supported, the fetch signal combines:
+
+- user cancellation;
+- per-attempt timeout.
+
+## 13.4 Permanent errors
+
+Non-retryable HTTP failures (for example ordinary `4xx` other than `429`) fail immediately.
+
+## 13.5 Exhausted retries
+
+A segment that cannot be fetched after the configured attempts is fatal.
+
+This is intentional. Older behavior silently skipped failed segments, which could produce a corrupt movie that looked successful.
+
+---
+
+# 14. Transmuxing and MP4 assembly
+
+## 14.1 MPEG-TS detection
+
+The downloader uses the MPEG-TS sync-byte pattern:
+
+```js
+view[0] === 0x47 && view[188] === 0x47
 ```
-The `moov` box contains `stts`, `stsc`, `stsz`, `stco` — a full index mapping
-every sample to a timestamp and byte offset. A player reads a few KB of header
-and instantly knows the duration and how to seek anywhere.
 
-**Fragmented MP4 (what mux.js produces):**
+## 14.2 TS → fragmented MP4
+
+TS segments are passed through:
+
+```js
+new muxjs.mp4.Transmuxer({
+  keepOriginalTimestamps: false,
+  remux: true
+})
 ```
-ftyp | moov (EMPTY sample tables + mvex) | moof|mdat | moof|mdat | moof|mdat | ...
+
+The first transmuxed output includes the init segment, and subsequent media fragments are appended in order.
+
+## 14.3 fMP4 / CMAF
+
+When a media playlist declares `EXT-X-MAP`, Crawlcast fetches that init segment.
+
+For the first non-TS segment, the init segment is prepended before the media fragment.
+
+## 14.4 Pass-through segments
+
+A non-TS segment without a special first-fragment init case is written as-is.
+
+## 14.5 Duration patch
+
+Before the final Blob is created, `patchInitSegmentDuration()` walks MP4 boxes in the first output chunk and updates version-0:
+
+- `mvhd` duration;
+- `tkhd` duration;
+- `mdhd` duration.
+
+The desired duration is the sum of parsed `#EXTINF` durations.
+
+This improves seek-bar behavior before the final native remux.
+
+## 14.6 Memory model
+
+HLS output is buffered as `Uint8Array` chunks, then converted to a `Blob`.
+
+Because both fragment buffers and Blob creation consume renderer memory, the downloader applies:
+
+```js
+this.memoryLimitBytes = 1.5e9;
 ```
-The sample tables are hollow *by design*. Timing lives inside each `moof` header,
-scattered throughout the file. This format exists for streaming, where you can't
-know the whole timeline up front.
 
-### The three symptoms this caused
+This is an **estimated source/media size guard**, not a precise process-memory ceiling.
 
-All from one root cause — **no index**:
+### Size estimation
 
-1. **Seeking snapped back to zero.** No table maps a timestamp to a byte offset,
-   and `mvhd` declared duration 0, so players couldn't compute a target.
-2. **Plex mobile wouldn't play.** Direct Play worked on desktop, but mobile
-   forced a transcode, and the ffmpeg transcoder needs to seek through the file.
-3. **Very slow startup everywhere.** With no `sidx` (segment index) and no `mfra`
-   (fragment random-access box), a player must parse *every* `moof` in the file
-   before it can build a timeline. 4130 fragments = a full-file scan before frame one.
+When variant bandwidth is known:
 
-### The partial fix we implemented
+```text
+bytes ≈ (bandwidth / 8) × durationSeconds
+```
 
-`patchInitSegmentDuration()` walks the init segment's box tree and writes the
-real duration (summed from `#EXTINF` values) into three places, each in its own
-timescale:
+Fallback when bandwidth is unknown:
 
-| Box | Field offset (v0) | Timescale |
-|---|---|---|
-| `mvhd` | `+20` timescale, `+24` duration | movie |
-| `tkhd` | `+28` duration | movie |
-| `mdhd` | `+20` timescale, `+24` duration | track-local |
+```text
+bytes ≈ segmentCount × 400 KB
+```
 
-Box layout is `[4 bytes size][4 bytes type][payload]`, and `moov`/`trak`/`mdia`
-are containers that must be recursed into. The walker skips `moof`/`mdat`.
+Direct MP4 downloads do not use this HLS memory path.
 
-Paired with `keepOriginalTimestamps: false` (rebasing the timeline to start at
-t=0 instead of preserving the stream's original PTS), this fixed the seek bar and
-seeking in mainstream players.
+---
 
-### What it does *not* fix
+# 15. Separate HLS audio
 
-The sample tables are still empty and there is still no `sidx`/`mfra`. Startup
-scanning and transcoder unhappiness remain. The complete fix is a remux:
+A selected video variant can reference an `AUDIO` group.
+
+`M3U8Parser.selectAudioRendition()`:
+
+1. filters `EXT-X-MEDIA` entries to matching `TYPE=AUDIO` + group ID + URI;
+2. prefers the default rendition;
+3. otherwise prefers the candidate reporting the greatest channel count.
+
+The audio rendition is downloaded separately after the video segments.
+
+## Audio processing
+
+`downloadAudioTrack()`:
+
+- fetches the audio media playlist;
+- fetches each audio segment;
+- transmuxes MPEG-TS audio through its own mux.js instance;
+- supports `EXT-X-MAP` for fragmented audio playlists;
+- logs raw ADTS AAC detection;
+- assembles an audio Blob;
+- reports an `audio` progress phase.
+
+The offscreen document saves the audio Blob as:
+
+```text
+<video-name>.audio.m4a
+```
+
+`background.js` records the audio path, then the native host merges it with the video:
 
 ```bash
-ffmpeg -i video.mp4 -c copy -movflags +faststart fixed.mp4
+ffmpeg -i video.mp4 -i video.audio.m4a \
+  -map 0:v:0 -map 1:a:0 \
+  -c copy -movflags +faststart -shortest output.mp4
 ```
 
-`-c copy` rebuilds real sample tables from the fragments without re-encoding;
-`+faststart` places `moov` at the front. Fast, lossless, and produces a normal
-seekable MP4.
+After a successful merge, the temporary audio file is deleted.
 
-**As of v1.1.1 this runs automatically** after every download when the native
-host and ffmpeg are available — see [§9.3](#93-post-download-remux). The
-verifiable difference is `moof` count: a repaired file contains **zero** `moof`
-boxes, proving it has genuine sample tables rather than a patched header.
+### Important limitation
 
-When the host is unavailable the file stays fragmented and the popup says so.
-`tools/remux.sh` repairs such files afterwards in bulk.
+Raw ADTS AAC is detected for logging, but there is no dedicated ADTS→M4A conversion branch in the current JavaScript path; non-TS/non-`EXT-X-MAP` audio bytes are passed through. This should be treated as an area requiring compatibility testing rather than assumed universal audio support.
 
 ---
 
-## 8. Thumbnails & Previews
+# 16. Thumbnails and metadata
 
-### High level
+Thumbnail generation is lazy and currently HLS-only.
 
-Each stream card shows an animated preview: 8 frames sampled across the whole
-video, cycling on hover. Generated lazily on first popup open, then cached.
+Direct MP4 cards use the placeholder instead of entering the HLS parser/thumbnail pipeline.
 
-### Low level
+## 16.1 Trigger
 
-Triggered when the popup finds streams lacking `thumbnail` or `meta`:
+After popup stream loading, HLS entries missing preview/meta are sent through:
 
-```
-popup: generateThumbnails(urls)
-  → background: dedupe via thumbnailJobs Set, ensureOffscreenDocument()
-    → offscreen: generateThumbnail(url) per stream
+```text
+popup.js → generateThumbnails → background.js → offscreen.js
 ```
 
-Inside `generateThumbnail()`:
+## 16.2 Master playlist strategy
 
-1. Fetch the master playlist. Sort variants by bandwidth.
-   - **Lowest** variant → used for frame sampling (cheapest to download)
-   - **Highest** variant → used for size estimation (that's what a download grabs)
-2. Fetch the chosen media playlist; sum `#EXTINF` for duration.
-3. Emit `streamMeta` immediately — size appears in the UI well before frames do.
-4. Choose 8 segment indices evenly spread across the playlist:
-   ```js
-   Math.round(i * (segments.length - 1) / (frameCount - 1))
-   ```
-   For 100 segments this yields `0, 14, 28, 42, 57, 71, 85, 99` — a scrub across
-   the entire video rather than the first few seconds.
-5. For each: fetch → transmux standalone (fresh transmuxer, since these segments
-   are non-contiguous) → blob URL → `<video>` → seek to midpoint → `<canvas>`
-   → 320 px JPEG at quality 0.6.
-6. Emit `thumbnailReady` with all frames.
+For preview work:
 
-Frames and metadata are cached on the stream record in `storage.session`.
-`thumbnailTried`/`metaTried` flags prevent retrying permanent failures (DRM,
-audio-only) on every popup open.
+- **lowest-bandwidth variant** is selected to reduce thumbnail traffic;
+- **highest-bandwidth variant** is remembered for size/resolution metadata because that is the variant the downloader will actually choose.
 
-**Hover animation** is pure JS in the popup: `mouseenter` starts a
-`setInterval` at `FRAME_INTERVAL_MS` (600 ms) cycling `img.src`; `mouseleave`
-clears it and restores frame 0. CSS adds a 1.5× scale and shadow on hover.
+## 16.3 Sampling
+
+Up to eight segments are selected evenly across the entire playlist.
+
+For each sample:
+
+1. fetch segment;
+2. if TS, transmux it independently;
+3. create temporary video Blob URL;
+4. decode with `<video>`;
+5. capture a midpoint frame with `<canvas>`;
+6. encode JPEG at quality `0.6`;
+7. revoke the temporary URL.
+
+The frames are cached on the stream entry.
+
+The popup cycles those frames every 600 ms while the cursor hovers the thumbnail.
+
+## 16.4 Metadata
+
+Metadata can include:
+
+```js
+{
+  durationSeconds,
+  segments,
+  resolution,
+  bandwidth,
+  bytes,
+  estimated: true
+}
+```
+
+If master bandwidth is unavailable, Crawlcast extrapolates total size from the sampled segment byte sizes.
 
 ---
 
-## 9. The Native Host
+# 17. Native MP4 inspection and repair
 
-One local process, reached over stdio, doing two unrelated jobs: downloading
-things the browser pipeline can't, and repairing files it produced.
+Native host name:
 
-Both are **optional**. Without the host the extension still detects streams,
-downloads HLS, and generates thumbnails — it just can't fetch non-HLS sources
-and leaves output fragmented.
-
-### 9.1 Protocol
-
-Chrome native messaging: stdio, each message framed as a 4-byte little-endian
-length prefix followed by UTF-8 JSON.
-
-```
-extension ──► {"url": "...", "outdir": "..."}            # download
-extension ──► {"action": "remux", "path": "C:/.../v.mp4"} # repair
-
-extension ◄── {"type": "progress", "percent": 12.3, "line": "..."}
-extension ◄── {"type": "done", "filename": "..."}
-extension ◄── {"type": "remuxed", "path": "...", "bytes": 123}
-extension ◄── {"type": "remuxSkipped", "message": "..."}
-extension ◄── {"type": "error", "message": "..."}
+```text
+com.crawlcast.downloader
 ```
 
-Binaries are configurable by environment variable, so nothing is hardcoded:
-`MITERUNO_DL_BIN` (default `yt-dlp`), `MITERUNO_FFMPEG_BIN` (`ffmpeg`),
-`MITERUNO_FFPROBE_BIN` (`ffprobe`).
+Main implementation:
 
-### 9.2 External downloads
-
-The in-browser pipeline handles HLS only, up to ~1.5 GB. Anything else routes
-here. The host spawns the configured downloader with
-`--newline --no-colors --progress`, parses progress lines by regex, and relays
-them. It keeps the last 10 output lines for error reporting and uses
-`CREATE_NO_WINDOW` on Windows to avoid a console flash.
-
-**Scope boundary (important for the writeup):** the extension contains no
-site-specific extraction logic. The bridge is a generic pipe — URL in, progress
-out. Whatever the external binary supports is what the bridge supports. Any
-capability beyond HLS comes from that external tool, not from this codebase.
-
-### 9.3 Post-download remux
-
-The in-browser pipeline emits fragmented MP4 ([§7](#7-mp4-container-internals)).
-This step repairs it automatically:
-
-```
-downloads.onChanged (state=complete)
-  → downloads.search({id}) → item.filename (absolute local path)
-    → connectNative → {"action":"remux", path}
-      → ffmpeg -nostdin -v error -y -i PATH -c copy -movflags +faststart TMP
-        → verify → os.replace(TMP, PATH)
-          → {"type":"remuxed"} → popup shows "Saved and repaired"
+```text
+native-host/crawlcast_host.py
 ```
 
-Three details that matter:
+## 17.1 Direct MP4 inspection
 
-**Staged, never in place.** ffmpeg cannot read and write the same path, so
-output goes to `<name>.remux.tmp<ext>` and is swapped with `os.replace()` only
-after verification. An interrupted or failed run cannot damage the original.
+Direct MP4 files with no separate-audio merge requirement are inspected before FFmpeg runs.
 
-**Verified by duration, not size.** A first implementation compared file sizes
-and wrongly rejected every `.ts` input, because MPEG-TS carries such heavy
-188-byte-packet overhead that a *correct* lossless remux can halve the file.
-`ffprobe` durations within 1% is the right test — it detects truncation without
-false failures.
+The host scans top-level MP4 boxes and checks:
 
-**Non-fatal by design.** Missing host, missing ffmpeg, or an unreadable file all
-produce `remuxSkipped`, and the popup shows an amber note explaining the
-playback consequences. The download itself is never reported as failed.
+- presence of `moov`;
+- presence of `mdat`;
+- whether `moov` occurs before `mdat`;
+- presence of `moof` fragmentation.
 
-### 9.4 Installation
+Possible reasons include:
 
-Requires a host manifest registered with Chrome (registry key on Windows, a JSON
-file in a specific directory on macOS/Linux), whose `allowed_origins` must
-contain the exact extension ID. **Chrome must be fully restarted** afterwards —
-registration is read at startup. Full instructions in `native-host/README.md`.
+- `already-optimized`
+- `fragmented`
+- `missing-moov`
+- `missing-mdat`
+- `moov-after-media`
+- malformed/inspection failures.
 
-> If downloads report *"Saved, but not repaired"*, the host is not reachable.
-> Check: files copied to a stable path, `path` in the manifest pointing at the
-> `.bat`, correct extension ID in `allowed_origins`, registry key present, and
-> Chrome fully quit and reopened.
+If the file is already optimized, Crawlcast returns completion without rewriting it.
 
-### 9.5 `tools/remux.sh`
+## 17.2 HLS output
 
-Standalone batch repair for files downloaded before this was automated, or on
-machines without the host. Same ffmpeg invocation and the same duration-based
-verification.
+HLS output is always sent to remux when the native host is available because the browser pipeline intentionally creates fragmented MP4.
+
+## 17.3 FFmpeg repair
+
+Normal repair is a stream copy:
 
 ```bash
-./remux.sh ~/Downloads        # copies into ./remuxed, originals untouched
-./remux.sh ~/Downloads -n     # dry run
-./remux.sh ~/Downloads -i -r  # in place, recursive
+ffmpeg -nostdin -v error -y \
+  -i input.mp4 \
+  -c copy \
+  -movflags +faststart \
+  temporary-output.mp4
 ```
 
-Filenames are preserved. Only `.ts`/`.mkv`/`.webm` change extension, since
-those containers cannot hold an MP4 index.
+No normal codec re-encode is performed.
+
+## 17.4 Verification
+
+After FFmpeg succeeds, the host probes source and output duration with FFprobe.
+
+Allowed duration tolerance:
+
+```text
+max(1% of source duration, 0.5 seconds)
+```
+
+Only after validation does the temporary output replace the source file.
+
+## 17.5 Native Messaging protocol
+
+Chrome sends little-endian 4-byte message length + UTF-8 JSON.
+
+### Requests
+
+```json
+{ "action": "inspect", "path": "..." }
+```
+
+```json
+{ "action": "remux", "path": "...", "audioPath": "...optional..." }
+```
+
+### Responses
+
+```text
+inspection
+remuxed
+remuxSkipped
+error
+```
+
+## 17.6 Registration
+
+On Windows, `register-native-host.ps1`:
+
+- requires an extension ID;
+- updates `allowed_origins`;
+- writes the host registry key under:
+
+```text
+HKCU\Software\Google\Chrome\NativeMessagingHosts\com.crawlcast.downloader
+```
+
+The WSL helper calls the PowerShell script with the supplied extension ID.
+
+Chrome should be fully restarted after registration changes.
 
 ---
 
-## 10. Message Protocol Reference
+# 18. Cross-context message protocol
 
-### Popup → Background
+The code does not currently define shared TypeScript/interface contracts, so action names are effectively the protocol.
 
-| Action | Payload | Response |
+This section is the current reference.
+
+## 18.1 Popup → background
+
+| Action | Main fields | Purpose |
 |---|---|---|
-| `getStreams` | `tabId` | `{streams}` with `downloading` flag |
-| `clearStreams` | `tabId` | `{success}` |
-| `startDownload` | `url`, `filename`, `tabId` | `{success, downloadId}` |
-| `cancelDownload` | `url` | `{success}` |
-| `startExternalDownload` | `url` | `{success}` |
-| `generateThumbnails` | `urls[]`, `tabId` | `{started}` |
+| `getModeState` | — | Read User/God mode and cooldown. |
+| `setMode` | `mode` | Switch `user` / `god`. |
+| `getStreams` | `tabId` | Get current tab's detected streams + live download flag. |
+| `setStreamTitle` | `url`, `title` | Persist editable title. |
+| `clearStreams` | `tabId` | Remove safe stream entries for current tab. |
+| `startDownload` | `url`, `filename`, `tabId` | Enforce mode and route MP4/HLS start. |
+| `generateThumbnails` | `tabId`, `urls` | Queue HLS analysis/preview. |
+| `cancelDownload` | `url` | Cancel direct browser download or offscreen HLS downloader. |
+| `getLogs` | — | Read centralized diagnostic buffer. |
+| `clearLogs` | — | Clear centralized diagnostic buffer. |
 
-### Background → Offscreen (`target: 'offscreen'`)
+## 18.2 Background → offscreen
 
-| Action | Payload |
-|---|---|
-| `downloadStream` | `url`, `filename` |
-| `cancelDownload` | `url` |
-| `generateThumbnail` | `url` |
-| `releaseBlob` | `blobUrl` |
+Messages include `target: "offscreen"`.
 
-### Background ↔ Native Host (port, not `sendMessage`)
+| Action | Main fields | Purpose |
+|---|---|---|
+| `downloadStream` | `url`, `filename` | Start HLS pipeline. |
+| `cancelDownload` | `url` | Abort `VideoDownloader`. |
+| `releaseBlob` | `blobUrl` | Revoke Blob URL after Chrome download no longer needs it. |
+| `generateThumbnail` | `url` | Start HLS preview/meta analysis. |
 
-| Direction | Message |
-|---|---|
-| → | `{url, outdir}` — external download |
-| → | `{action:'remux', path}` — repair a saved file |
-| ← | `{type:'progress', percent, line}` |
-| ← | `{type:'done', filename}` |
-| ← | `{type:'remuxed', path, bytes}` |
-| ← | `{type:'remuxSkipped', message}` |
-| ← | `{type:'error', message}` |
+## 18.3 Offscreen → background / popup broadcast path
 
-### Offscreen → Background
+| Action | Main fields | Purpose |
+|---|---|---|
+| `log` | `level`, `source`, `message` | Central diagnostics. |
+| `downloadProgress` | `url`, `progress` | HLS progress heartbeat. |
+| `saveBlob` | video/audio Blob URLs + names + merge flags | Ask background to save output. |
+| `downloadError` | `url`, `error`, `tooLarge` | HLS failure. |
+| `streamMeta` | `url`, `meta` | Size/duration/resolution estimates. |
+| `thumbnailReady` | `url`, `thumbnail`, `frames` | Cache/display preview frames. |
 
-| Action | Payload |
-|---|---|
-| `saveBlob` | `blobUrl`, `filename`, `streamUrl` |
-| `downloadProgress` | `url`, `progress` |
-| `downloadError` | `url`, `error`, `tooLarge` |
-| `streamMeta` | `url`, `meta` |
-| `thumbnailReady` | `url`, `thumbnail`, `frames[]` |
-
-### Background → Popup (broadcast; ignored if popup closed)
+## 18.4 Background broadcasts consumed by popup
 
 | Action | Meaning |
 |---|---|
-| `downloadProgress` | Segment progress or `phase:'finalizing'` |
-| `downloadComplete` | File saved |
-| `downloadError` | Failed; `tooLarge` triggers the bridge handoff button |
-| `remuxStarted` | Repair began |
-| `remuxComplete` | Repaired — file now seeks properly |
-| `remuxSkipped` | Saved but left fragmented (amber, not an error) |
-| `streamMeta` | Size / duration / resolution for a card |
-| `thumbnailReady` | Preview frames ready |
-| `externalProgress` / `externalComplete` / `externalError` | Native-host download |
-
-> All `sendMessage` calls are `.catch(() => {})` — a closed popup rejects, and
-> that is expected, not an error.
+| `downloadProgress` | Update direct or HLS progress. |
+| `downloadComplete` | Browser has accepted/saved the file; final processing may still follow. |
+| `downloadError` | Current download failed/cancelled. |
+| `audioWarning` | Separate audio could not be merged/downloaded. |
+| `remuxStarted` | Native repair/merge began. |
+| `remuxComplete` | Final MP4 processing succeeded or direct MP4 was already optimized. |
+| `remuxSkipped` | File saved, but native finalization did not happen. |
+| `streamMeta` | Patch metadata into card. |
+| `thumbnailReady` | Replace placeholder and attach hover animation. |
 
 ---
 
-## 11. Known Limitations & Trade-offs
+# 19. Diagnostics and logging
 
-| Limitation | Cause | Mitigation |
-|---|---|---|
-| Output MP4 is fragmented — slow startup, poor transcoder support | mux.js emits fMP4; no `sidx`/`mfra`; empty sample tables | **Auto-remuxed after download** when the native host + ffmpeg are present. Without them the file stays fragmented; repair later with `tools/remux.sh` |
-| Hard ~1.5 GB size ceiling | Everything buffered in memory; peak ≈ 2× video size | Size guard + external bridge handoff |
-| Only detects `.m3u8` | Detection is extension-based pattern matching | Bridge handles other formats |
-| **YouTube VOD unsupported** | Uses DASH/progressive, not HLS; URLs protected by `signatureCipher` and `n` throttling | Out of scope by design — circumventing those protections is both a ToS violation and a deliberate non-goal of this codebase |
-| Streams lost on browser close | `storage.session` clears at browser exit | Intentional — avoids stale data |
-| Site-service-worker requests show `tabId: -1` | Chrome reports no tab for those | Known; not currently handled |
-| Only one offscreen document allowed | Chrome limitation | Downloads share it; concurrent large downloads risk OOM |
+The download pipeline spans different consoles, so Crawlcast centralizes diagnostics in `background.js`.
 
+## Log entry shape
 
----
+```js
+{
+  ts,
+  level,
+  source,
+  message
+}
+```
 
-## 12. Testing Notes
+## Buffer behavior
 
-No test framework is wired up; verification so far has been targeted harnesses
-run under Node with browser globals stubbed. Worth preserving as regression tests:
+- maximum 400 entries;
+- older entries are trimmed;
+- storage writes are debounced by one second;
+- persisted in `chrome.storage.session`.
 
-**Ordering + concurrency** — mock `fetch` with random latency, assert writes
-arrive in playlist order, max in-flight ≤ 4, and a failing segment is skipped
-without stalling.
+## Sources
 
-**Timeout** — mock a segment whose fetch never settles; assert the pipeline
-completes rather than hanging (it did, in <1 s with a 300 ms timeout).
+### Background
 
-**Duration patching** — build a synthetic `ftyp`+`moov`+`moof` buffer, patch it,
-read back `mvhd`/`tkhd`/`mdhd` and confirm each equals `duration × its timescale`.
+`console.log`, `console.warn`, and `console.error` are wrapped and copied into the buffer.
 
-**Progress display** — assert 4127/4130 renders 99%, and only 4130/4130 renders 100%.
+### Offscreen / downloader
 
-**Native host — downloads** — pipe a length-prefixed message to
-`miteruno_host.py` with `MITERUNO_DL_BIN` pointed at a mock script; assert
-progress/done framing, plus the three failure modes (missing binary, bad URL,
-non-zero exit).
+`offscreen.js` wraps its console, which also captures `downloader.js` output because they share the same offscreen page.
 
-**Native host — remux** — build a genuinely fragmented MP4 with
-`ffmpeg -movflags 'frag_keyframe+empty_moov+default_base_moof'`, send
-`{action:'remux'}`, then assert the output has **zero `moof` boxes**, `moov`
-before `mdat`, an unchanged duration, the same filename, and no leftover
-`.remux.tmp` file. Failure paths: missing file, missing path, absent ffmpeg
-(via `MITERUNO_FFMPEG_BIN`), and a corrupt input — each must leave the original
-untouched.
+Extremely noisy per-segment `Fetching segment ...` lines are filtered from the popup log buffer.
 
-**`tools/remux.sh`** — a directory containing filenames with spaces and
-parentheses, a `.ts` needing extension promotion, a corrupt file, plus empty and
-missing directories. Assert skip-existing, `-f`, `-r` (and that it prunes its
-own `remuxed/` output), and that `-i` swaps atomically.
+## Popup log window
+
+The floating log window supports:
+
+- refresh;
+- copy all;
+- clear;
+- close;
+- automatic refresh on incoming progress while open.
 
 ---
 
-## 13. Change Log
+# 20. Cancellation and cleanup
 
-> Append new entries at the top. Note *why*, not just *what*.
+## Direct MP4 cancellation
 
-### 1.0.0 — 2026-08-04 — Himitsu rebrand
+1. remove active tracking;
+2. remove persisted direct-download mapping;
+3. call `chrome.downloads.cancel(downloadId)`;
+4. broadcast cancelled state.
 
-Renamed from "M3U8 Video Downloader" to **Himitsu**, and the version counter
-restarted at 1.0.0 under the new name. The pre-rebrand history below (as
-"M3U8 Video Downloader," through 1.2.0) still describes real, shipped
-behaviour — nothing was reverted, only renamed.
+## HLS cancellation
 
-- **Retries raised from 3 to 20**, still linear backoff (`1000ms × attempt`).
-  A stalled/flaky segment now gets substantially more chances before the
-  downloader gives up on it and moves on.
+1. remove background active tracking;
+2. send `cancelDownload` to offscreen;
+3. `VideoDownloader.cancel()` aborts its `AbortController`;
+4. offscreen removes the running downloader;
+5. UI receives cancellation/error state.
 
----
+## Blob cleanup
 
-### Pre-rebrand history (as "M3U8 Video Downloader")
+HLS Blob URLs must remain alive until Chrome finishes consuming them.
 
-### 1.2.0 — 2026-08-01
+`pendingBlobUrls` maps Chrome download IDs to Blob URLs.
 
-- **Separate audio renditions are now downloaded.** Previously the parser
-  ignored `#EXT-X-MEDIA` entirely and the downloader only ever fetched the
-  video variant's segments. When a stream muxes audio into those segments
-  (typical for TV episodes) that worked; when audio is a **separate
-  rendition** — normal for films, which ship multiple languages and 5.1 —
-  the result was a **silent video**. The parser now reads renditions and the
-  `AUDIO=` group, `selectAudioRendition()` picks the default (or
-  highest-channel) track, and the downloader fetches it through its own
-  transmuxer. ffmpeg merges the two with `-map 0:v:0 -map 1:a:0 -c copy` in
-  the same pass that writes the index.
-- **Attribute parsing rewritten.** `parseStreamInf` split on commas, which
-  corrupted `CODECS="avc1.640028,mp4a.40.2"`. Now a quote-aware parser, which
-  is also what makes `#EXT-X-MEDIA` parsing viable.
-- **Graceful degradation.** No native host, or audio download failed → the
-  video still saves and the popup warns that the file will be silent, with
-  the manual ffmpeg command. Never a lost download.
-- **Dead code removed.** Placeholder `<h1>` in popup.html, unused
-  `lib/StreamSaver.min.js`, the orphaned `getProgress` handler, and the
-  `web_accessible_resources` entry that only existed for StreamSaver.
+After download completes or is interrupted:
 
-### 1.1.1 — 2026-07-31
+```text
+background.js → releaseBlob → offscreen.js → URL.revokeObjectURL()
+```
 
-- **Automatic post-download remux.** When a download finishes,
-  `chrome.downloads.search()` yields the saved file's absolute path, which is
-  sent to the native host with `{action:"remux"}`. The host runs
-  `ffmpeg -c copy -movflags +faststart`, verifies the result by **duration**
-  (not size — a lossless remux can legitimately shrink a file), and swaps it
-  in place. Output has real sample tables and zero `moof` boxes: it starts
-  instantly, seeks correctly, and transcodes on Plex.
-  Fully optional and non-fatal — with no host or no ffmpeg the file is simply
-  left fragmented and the popup says so in amber rather than reporting an error.
-- **`tools/remux.sh`** for repairing existing files in bulk.
+## Offscreen cleanup
 
-### 1.1.0 — 2026-07-30
+`maybeCloseOffscreen()` closes the hidden document only when there are no:
 
-- **Size shown before download.** Cards display estimated size, duration,
-  resolution, and segment count. Oversized streams flagged amber with a handoff
-  hint. Reuses the thumbnail job's playlist fetches, so no extra network cost.
-- **Stall fix.** Per-attempt 30 s segment timeout via `AbortSignal.any()`.
-  Previously a hung request froze a download permanently.
-- **Honest progress.** `Math.floor` + 99% cap until all segments are accounted
-  for (`Math.round` displayed 100% from 4109/4130). Added a "Finalizing" phase.
-- **Working cancel.** The old handler referenced `.downloader` on a background
-  record that no longer holds it — dead code. Now forwards to offscreen, which
-  tracks live instances. Clear force-releases downloads stale >2 min.
-- **Size guard.** Refuse in-browser downloads over 1.5 GB with a one-click
-  handoff, instead of silently OOM-ing the offscreen document.
-- **External downloader bridge.** Native messaging host + popup panel.
-- **Animated previews.** 8 frames spread across the whole video, 600 ms cycle
-  on hover. (First cut sampled only the first segment — too narrow to read.)
-- **Download button state persisted.** `getStreams` now stamps `downloading`
-  from background state; the popup's own map dies when it closes.
-- **Clear preserves active downloads.**
-- **Memory hygiene.** Revoke blob URLs after save, free chunk buffers, close
-  the idle offscreen document.
-- **Parallel fetching.** Sliding window of 4 with strictly ordered processing.
-- **Seekable output.** Duration patched into `mvhd`/`tkhd`/`mdhd`; timestamps
-  rebased to t=0.
-- **Download pipeline rearchitected** to the offscreen document; StreamSaver
-  dropped (needs a DOM the service worker doesn't have).
-- **Parser fix.** Guard `currentVariant` before assigning `.url` — media
-  playlists were crashing the whole download.
-- **Stream list persistence** via `chrome.storage.session`.
-- **Fixed `lib/mux.min.js`** — was a 9-byte "Not Found" HTML page, which threw
-  on `importScripts` line 1 and killed the entire service worker. Root cause of
-  "nothing works."
+- active non-direct downloads;
+- pending HLS Blob URLs;
+- thumbnail jobs.
+
+## Clear button
+
+Clear removes detected streams for the active tab unless a tracked download has had recent activity.
+
+A download with no activity for two minutes is considered stale and can be released by Clear.
 
 ---
 
-## 14. Future Work
+# 21. Known limits and implementation gaps
 
-**Defragment without external tools.** The native-host remux (v1.1.1) solves
-this whenever the host and ffmpeg are installed, but not otherwise. Two ways to
-close that gap, both deliberately deferred:
+This section describes actual current limits, not future intent.
 
-- *`ffmpeg.wasm` in the offscreen document* — self-contained, but MV3 requires
-  vendoring the ~30 MB WASM binary, and wasm32's ~2 GB address space must hold
-  input and output simultaneously. It would fail on exactly the large files that
-  need it most.
-- *Write real sample tables during transmux* — buffer sample metadata and emit
-  `stts`/`stsc`/`stsz`/`stco` with a single `moov` + `mdat`, producing a correct
-  file with no second pass and no dependencies. The right answer architecturally;
-  effectively implementing part of an MP4 muxer, since mux.js offers no help.
+## Media protocols
 
-**Stream to disk.** Replace in-memory buffering with the File System Access API
-to remove the size ceiling entirely and make the bridge unnecessary for large files.
+Currently detected/downloaded:
 
-**Quality selection.** Currently hardcoded to highest bandwidth. The variant list
-is already parsed — surfacing a picker is mostly UI work.
+- `.m3u8` HLS;
+- direct `.mp4`.
 
-**Resume interrupted downloads.** Segment-level progress could persist, letting a
-failed download restart where it stopped rather than from zero.
+Not currently implemented as dedicated pipelines:
 
-**Handle `tabId: -1`.** Attribute service-worker-initiated requests to the active
-tab so those streams stop vanishing from the popup.
+- DASH / `.mpd`;
+- WebM-specific detection;
+- generic blob/MSE extraction;
+- DRM/protected media;
+- site-specific extraction logic.
 
-**Delete dead code.** `lib/StreamSaver.min.js`, the unused `getProgress` handler,
-and the placeholder `<h1>` in `popup.html`.
+## HLS features not comprehensively supported
+
+Current parser/downloader does not implement complete HLS specification coverage, including important cases such as:
+
+- encrypted `EXT-X-KEY` media;
+- byte-range segment workflows;
+- live playlist polling/refresh;
+- per-segment `EXT-X-MAP` changes across complex discontinuities;
+- subtitle download/packaging;
+- user-selectable quality;
+- every possible alternate audio packaging format.
+
+## HLS memory ceiling
+
+HLS is assembled in renderer memory and currently guarded at ~1.5 GB estimated media size.
+
+Large direct MP4s do not share this restriction because Chrome handles them directly.
+
+## Same-URL multi-tab behavior
+
+Detected streams are keyed globally by URL, so the same exact URL detected in multiple tabs is not independently represented per tab.
+
+## HLS worker restart durability
+
+Detected stream state survives MV3 worker restarts.
+
+Direct MP4 download state has explicit restoration.
+
+HLS active-download bookkeeping, pending Blob tracking, and pending audio merge state are primarily in-memory and do not have equivalent full restoration logic.
+
+## Direct MP4 metadata
+
+Direct MP4s currently skip the HLS thumbnail/metadata analysis path, so their cards generally show `Direct MP4` rather than HLS-derived size/resolution/duration metadata before download.
+
+## Native host dependency
+
+Without the native host:
+
+- direct MP4 can still download;
+- HLS output can still be saved;
+- final MP4 repair cannot run;
+- separately delivered HLS audio cannot be merged into the final video.
+
+## Premium
+
+Premium is visual scaffolding only. No paid entitlement exists yet.
+
+---
+
+# 22. Unused / stale repository artifacts
+
+These files are present in the current uploaded snapshot but are **not part of the active runtime path**.
+
+## `auth.js`
+
+Contains an old Himitsu/private-test login stub with a mock token and localhost endpoint.
+
+Current searches show no runtime file loads or calls it.
+
+Do not treat this as Crawlcast's current Premium/account implementation.
+
+## `lib/StreamSaver.min.js`
+
+Present in the repository but not loaded by `offscreen.html` and not referenced by current source files.
+
+The active HLS path uses in-memory chunks → Blob → `chrome.downloads`, not StreamSaver.
+
+## `native-host/README.md`
+
+The file still describes the old **Miteruno external downloader / yt-dlp bridge** architecture and names.
+
+That is not what the current `crawlcast_host.py` does.
+
+Current native host behavior is MP4 inspection/remux/repair only, as documented in this file.
+
+## Zone.Identifier files under `.git`
+
+The uploaded repo contains Windows `Zone.Identifier` artifacts inside `.git` metadata. These are not part of the extension runtime and have previously caused invalid Git ref problems when created under `.git/refs`.
+
+They should never be included in a Chrome Web Store package.
+
+---
+
+# 23. Development workflow
+
+## Load unpacked
+
+1. Open `chrome://extensions`.
+2. Enable Developer mode.
+3. Choose **Load unpacked**.
+4. Select the repository root.
+5. Pin Crawlcast if desired.
+
+There is currently no build/transpile step; runtime extension code is plain JavaScript loaded directly from the repository.
+
+## After source changes
+
+1. save changes;
+2. click **Reload** for Crawlcast in `chrome://extensions`;
+3. refresh the target webpage when testing request detection;
+4. start/restart playback to cause media requests to occur again.
+
+## Debugging surfaces
+
+### Popup
+
+Right-click popup → Inspect.
+
+Useful for:
+
+- card rendering;
+- title editing;
+- rate-limit UI;
+- progress state;
+- CSS.
+
+### Service worker
+
+`chrome://extensions` → Crawlcast → Service worker.
+
+Useful for:
+
+- detection;
+- mode state;
+- browser download events;
+- Blob save handoff;
+- native-host connection;
+- stream registry.
+
+### Floating Crawlcast logs
+
+Use the **Logs** toolbar button.
+
+Useful for seeing background + offscreen/downloader output together.
+
+### Native host
+
+Verify from the same OS environment Chrome uses:
+
+```bash
+ffmpeg -version
+ffprobe -version
+```
+
+After native registration changes, fully exit/restart Chrome.
+
+---
+
+# 24. Testing matrix
+
+Changes to Crawlcast should be tested against both download paths.
+
+## Detection
+
+- [ ] HLS master playlist URL detected.
+- [ ] HLS direct media playlist URL detected.
+- [ ] Direct MP4 URL detected.
+- [ ] MP4 URL with query string detected.
+- [ ] M3U8 URL with query string detected.
+- [ ] Correct current-tab filtering.
+- [ ] Badge count updates.
+
+## Popup
+
+- [ ] Page title appears on card.
+- [ ] Clicking title enters edit mode.
+- [ ] Pencil enters edit mode.
+- [ ] Enter/blur saves.
+- [ ] Escape cancels.
+- [ ] Edited title survives popup close/reopen during the browser session.
+- [ ] Invalid filename characters are sanitized.
+- [ ] Clear does not kill a healthy active download.
+- [ ] Logs open as floating panel.
+
+## User Mode
+
+- [ ] Fresh/default mode is User.
+- [ ] First download is accepted.
+- [ ] Second download within the hour is blocked.
+- [ ] Purple countdown appears in Premium panel.
+- [ ] Countdown updates every second.
+- [ ] Buttons re-enable at expiry.
+- [ ] Closing/reopening popup does not reset limit.
+- [ ] God Mode bypasses limit during development.
+
+## Direct MP4
+
+- [ ] Download starts through Chrome.
+- [ ] Byte progress updates.
+- [ ] Cancel works.
+- [ ] Browser/service-worker restart restoration is sane.
+- [ ] Already-faststart MP4 skips FFmpeg.
+- [ ] `moov`-after-`mdat` MP4 remuxes.
+- [ ] Fragmented MP4 remuxes.
+- [ ] Final UI says Complete.
+
+## HLS
+
+- [ ] Master playlist chooses highest-bandwidth variant.
+- [ ] Direct media playlist downloads.
+- [ ] MPEG-TS segments transmux.
+- [ ] fMP4/CMAF + `EXT-X-MAP` downloads.
+- [ ] Estimated >1.5 GB source is rejected before full buffering.
+- [ ] Progress stays ordered.
+- [ ] Cancellation works.
+- [ ] Final Blob saves through Chrome.
+- [ ] Native host repairs fragmented result.
+
+## Retry/CDN behavior
+
+- [ ] temporary 503 retries;
+- [ ] temporary 429 retries;
+- [ ] `Retry-After` is honored;
+- [ ] exponential delay is capped;
+- [ ] permanent 404 fails immediately;
+- [ ] exhausted retries fail the movie instead of skipping a segment;
+- [ ] cancel exits retry wait promptly.
+
+## HLS audio
+
+- [ ] muxed audio remains present.
+- [ ] separate default audio rendition is selected.
+- [ ] separate audio file is saved.
+- [ ] native host merges audio/video.
+- [ ] missing audio reports warning instead of falsely reporting a fully merged file.
+
+## Native host unavailable
+
+- [ ] browser download still saves.
+- [ ] UI reports repair skipped rather than hanging.
+- [ ] separate-audio warning explains the limitation.
+
+---
+
+# 25. Store / production readiness
+
+Crawlcast is not yet in final production/store configuration.
+
+## Current release blockers / decisions
+
+### Manifest cleanup
+
+Current snapshot still needs production review for:
+
+- customer-facing description;
+- host permission scope;
+- permission justification;
+- versioning/release process.
+
+### God Mode
+
+The customer-facing God Mode toggle should not ship as the mechanism for bypassing the free limit.
+
+The planned production model is:
+
+```text
+Free/User entitlement → 1 download per hour
+Premium entitlement   → paid limits/features
+Development override  → internal only
+```
+
+### Premium backend
+
+Still required:
+
+- payment provider;
+- checkout flow;
+- customer identity;
+- entitlement service;
+- extension entitlement refresh/cache;
+- subscription lifecycle handling;
+- restore/access-across-devices policy.
+
+### Native host distribution
+
+The extension cannot assume customers already have the local native host installed.
+
+A production strategy must define:
+
+- supported operating systems;
+- installer/package;
+- host registration;
+- FFmpeg/FFprobe distribution or dependency policy;
+- extension ID handling;
+- upgrade path;
+- user-facing repair availability status.
+
+### Store package hygiene
+
+The Web Store upload should not contain development-only material such as:
+
+- `.git/`;
+- Zone.Identifier artifacts;
+- unrelated repair tools unless intentionally shipped;
+- stale auth code;
+- stale native-host documentation;
+- unused dependencies.
+
+Any removals should be made deliberately and tested, not as opportunistic cleanup during unrelated feature work.
+
+---
+
+# 26. Change-safety notes
+
+Crawlcast has several boundaries where small-looking changes can have large effects.
+
+## Do not route direct MP4 through `VideoDownloader`
+
+Direct MP4 and HLS intentionally use separate pipelines.
+
+Direct MP4 should remain browser-managed unless there is a specific reason to redesign it.
+
+## Do not move HLS DOM work into the service worker
+
+The offscreen document exists because the service worker lacks the APIs used for:
+
+- `Blob` URL creation lifecycle;
+- `<video>`;
+- `<canvas>`;
+- current media preview work.
+
+## Preserve ordered transmuxing
+
+Fetch concurrency can be tuned, but segments must be processed by the shared transmuxer in playlist order.
+
+## Do not silently skip failed HLS segments
+
+The current retry behavior intentionally fails the download after terminal segment failure.
+
+Returning to silent skipping can produce corrupted output that appears successful.
+
+## Keep popup state non-authoritative
+
+The popup can close at any time. Important state must live in the service worker/storage/browser download manager, not only in popup variables.
+
+## Keep native repair lossless by default
+
+Current repair uses stream copy. Reintroducing mandatory audio/video transcoding would substantially increase repair time and change media quality/codec behavior.
+
+## Test both media paths
+
+A change that fixes HLS can accidentally affect direct MP4 orchestration, and vice versa. Always test both.
+
+---
+
+# Current implementation summary
+
+```text
+REQUEST DETECTION
+    background.js
+        ├─ .mp4  ──> chrome.downloads ──> native inspect ──> optional remux ──> COMPLETE
+        │
+        └─ .m3u8 ──> offscreen.js
+                        ├─ m3u8-parser.js
+                        ├─ downloader.js
+                        │    ├─ retry/backoff
+                        │    ├─ ordered segment processing
+                        │    ├─ mux.js TS→fMP4
+                        │    └─ optional separate audio
+                        └─ Blob URL
+                              │
+                              ▼
+                        background.js
+                              │
+                              ▼
+                        chrome.downloads
+                              │
+                              ▼
+                        native FFmpeg repair/merge
+                              │
+                              ▼
+                           COMPLETE
+```
+
+**Crawlcast's current core is a two-path media downloader coordinated by an MV3 service worker, with an offscreen HLS processing pipeline and an optional native MP4 finalization layer.**
