@@ -66,9 +66,11 @@ function initAppHandlers() {
     }
     if (message.action === 'remuxComplete') {
       markDownloadComplete(message.url);
-      setStatus(message.url, 'status-success', message.merged
-        ? '✅ Complete — audio merged and MP4 repaired'
-        : '✅ Complete — MP4 saved and repaired');
+      setStatus(message.url, 'status-success', message.alreadyOptimized
+        ? '✅ Complete — MP4 was already optimized'
+        : (message.merged
+          ? '✅ Complete — audio merged and MP4 repaired'
+          : '✅ Complete — MP4 saved and repaired'));
     }
     if (message.action === 'remuxSkipped') {
       // Not an error: the file downloaded fine, it just wasn't defragmented
@@ -628,10 +630,14 @@ function setStatus(url, className, text) {
 }
 
 function onDownloadComplete(url, result) {
-  // chrome.downloads has accepted the file, but Crawlcast may still need to
-  // repair the MP4. Keep the card in its active state until remuxComplete.
-  setDownloadStage(url, 'Saving MP4 file…', 100);
-  setStatus(url, 'status-success', `💾 Saved ${result.filename} — finishing MP4 processing…`);
+  // chrome.downloads has accepted the file. Direct MP4s are inspected first
+  // and skip the remux entirely when already optimized; HLS output still
+  // needs the normal fast stream-copy repair.
+  const isDirectMp4 = getStreamFormat(url) === 'mp4';
+  setDownloadStage(url, isDirectMp4 ? 'Checking MP4 file…' : 'Saving MP4 file…', 100);
+  setStatus(url, 'status-success', isDirectMp4
+    ? `💾 Saved ${result.filename} — checking MP4 structure…`
+    : `💾 Saved ${result.filename} — finishing MP4 processing…`);
 }
 
 function setDownloadStage(url, label, percentValue) {
@@ -799,7 +805,7 @@ function getStreamTitle(stream, pageTitle) {
 
 function getStreamFormat(stream) {
   if (stream?.format === 'mp4' || stream?.format === 'm3u8') return stream.format;
-  const url = stream?.url || '';
+  const url = typeof stream === 'string' ? stream : (stream?.url || '');
   return /\.mp4(?:$|[?#])/i.test(url) ? 'mp4' : 'm3u8';
 }
 

@@ -1,32 +1,19 @@
 #!/usr/bin/env python3
-"""Crawlcast native messaging host for MP4 remux/repair operations.
+"""Crawlcast native messaging host for MP4 inspection and remux/repair.
 
 Protocol: Chrome native messaging over stdin/stdout using length-prefixed JSON.
 """
 
 import json
 import os
-import re
 import struct
 import subprocess
 import sys
 
-# Used to repair fragmented MP4s produced by the in-browser pipeline.
-# Optional: if absent, files are simply left as they are.
+# Used to repair fragmented/non-faststart MP4s produced by the in-browser
+# pipeline. Optional: if absent, files are simply left as they are.
 FFMPEG_BIN = os.environ.get("CRAWLCAST_FFMPEG_BIN", "ffmpeg")
 FFPROBE_BIN = os.environ.get("CRAWLCAST_FFPROBE_BIN", "ffprobe")
-
-# Loudness normalization target, applied to every remuxed file that has an
-# audio track (two-pass EBU R128-style loudnorm). I=-16 LUFS matches common
-# streaming-platform targets; TP=-1.5 dBTP leaves true-peak headroom; LRA=11
-# caps how much loudness varies within one file. Using the same targets for
-# every download is what makes separately-downloaded files land at a
-# consistent, comparable volume instead of some being much louder/quieter
-# or "flatter" than others.
-LOUDNORM_I = "-16"
-LOUDNORM_TP = "-1.5"
-LOUDNORM_LRA = "11"
-
 
 
 # ----------------------------------------------------------- wire protocol
@@ -49,89 +36,99 @@ def send_message(obj):
     sys.stdout.buffer.flush()
 
 
+# --------------------------------------------------------------- inspection
+
+def inspect_mp4(path):
+    """Return whether an MP4 needs remuxing for normal indexed/faststart use.
+
+    A normal seekable MP4 should have its ``moov`` metadata before media data
+    and should not contain top-level ``moof`` fragments. The check only reads
+    MP4 box headers, not media payloads, so even very large direct downloads
+    can be classified quickly.
+    """
+    if not path or not isinstance(path, str):
+        return True, "invalid-path"
+    if not os.path.isfile(path):
+        return True, "file-not-found"
+
+    try:
+        file_size = os.path.getsize(path)
+        moov_offset = None
+        mdat_offset = None
+        fragmented = False
+        offset = 0
+
+        with open(path, "rb") as handle:
+            while offset + 8 <= file_size:
+                handle.seek(offset)
+                header = handle.read(8)
+                if len(header) != 8:
+                    break
+
+                box_size = struct.unpack(">I", header[:4])[0]
+                box_type = header[4:8]
+                header_size = 8
+
+                if box_size == 1:
+                    extended = handle.read(8)
+                    if len(extended) != 8:
+                        return True, "invalid-box-header"
+                    box_size = struct.unpack(">Q", extended)[0]
+                    header_size = 16
+                elif box_size == 0:
+                    box_size = file_size - offset
+
+                if box_size < header_size or offset + box_size > file_size:
+                    return True, "invalid-box-size"
+
+                if box_type == b"moov" and moov_offset is None:
+                    moov_offset = offset
+                elif box_type == b"mdat" and mdat_offset is None:
+                    mdat_offset = offset
+                elif box_type == b"moof":
+                    fragmented = True
+
+                offset += box_size
+
+        if fragmented:
+            return True, "fragmented"
+        if moov_offset is None:
+            return True, "missing-moov"
+        if mdat_offset is None:
+            return True, "missing-mdat"
+        if moov_offset > mdat_offset:
+            return True, "moov-after-media"
+        return False, "already-optimized"
+    except OSError:
+        return True, "inspection-failed"
+
+
+def send_inspection(path):
+    if not path or not isinstance(path, str):
+        send_message({"type": "error", "message": "A file path is required"})
+        return
+    if not os.path.isfile(path):
+        send_message({"type": "error", "message": f"File not found: {path}"})
+        return
+
+    needs_remux, reason = inspect_mp4(path)
+    send_message({
+        "type": "inspection",
+        "path": path,
+        "needsRemux": needs_remux,
+        "reason": reason,
+    })
+
+
 # --------------------------------------------------------------- execution
 
-def has_audio_stream(path):
-    """True if ffprobe finds at least one audio stream in path."""
-    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
-    try:
-        out = subprocess.run(
-            [FFPROBE_BIN, "-v", "error", "-select_streams", "a",
-             "-show_entries", "stream=index", "-of", "csv=p=0", path],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            universal_newlines=True, creationflags=creationflags,
-        )
-        return bool(out.stdout.strip())
-    except (FileNotFoundError, OSError):
-        return False
-
-
-def measure_loudness(path):
-    """
-    Pass 1 of two-pass loudnorm: analyze path's audio against the LOUDNORM_*
-    targets and return the measured stats dict, or None on any failure
-    (missing ffmpeg, no audio, unparseable output) so callers can fall back
-    to an unnormalized remux rather than losing the file.
-
-    Deliberately does not pass "-v error" — loudnorm prints its JSON stats
-    at the info log level, which "-v error" would silently swallow along
-    with everything else.
-    """
-    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
-    cmd = [FFMPEG_BIN, "-nostdin", "-hide_banner", "-y",
-           "-i", path,
-           "-af", f"loudnorm=I={LOUDNORM_I}:TP={LOUDNORM_TP}:LRA={LOUDNORM_LRA}:print_format=json",
-           "-f", "null", "-"]
-    try:
-        proc = subprocess.run(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            universal_newlines=True, creationflags=creationflags,
-        )
-    except (FileNotFoundError, OSError):
-        return None
-
-    match = re.search(r'\{[^{}]*"input_i"[^{}]*\}', proc.stdout or "", re.DOTALL)
-    if not match:
-        return None
-    try:
-        return json.loads(match.group(0))
-    except json.JSONDecodeError:
-        return None
-
-
-def build_loudnorm_filter(stats):
-    """Second-pass loudnorm filter string, fed pass 1's measured values."""
-    return (
-        f"loudnorm=I={LOUDNORM_I}:TP={LOUDNORM_TP}:LRA={LOUDNORM_LRA}"
-        f":measured_I={stats['input_i']}:measured_TP={stats['input_tp']}"
-        f":measured_LRA={stats['input_lra']}:measured_thresh={stats['input_thresh']}"
-        f":offset={stats['target_offset']}:linear=true:print_format=summary"
-    )
-
-
 def run_remux(path, audio_path=None):
-    """
-    Rebuild a fragmented MP4 into a normal, seekable one, in place, and
-    loudness-normalize its audio.
+    """Rebuild an MP4 into a normal, seekable/faststart file in place.
 
-    The in-browser pipeline emits fragmented MP4: empty sample tables, no
-    sidx/mfra index. Players must scan every fragment before playback, which
-    causes slow startup, broken seeking, and transcoder failures. Running
-    `-c copy` rebuilds real sample tables without re-encoding; +faststart puts
-    moov at the front. The video stream stays a lossless copy either way.
-
-    When the file has an audio track, its audio is additionally re-encoded
-    through a two-pass loudnorm pass (see LOUDNORM_* above) so every
-    download ends up at the same target loudness and dynamic range, rather
-    than each stream keeping whatever level the source happened to have.
-    That step only touches audio — if it fails for any reason (no audio
-    track, ffmpeg/ffprobe missing, unparseable measurement), this silently
-    falls back to the previous plain, lossless `-c copy` behavior so the
-    file is never lost over it.
-
-    When audio_path is given, the stream had a separate audio rendition and
-    the two files are merged in the same pass — the video file on its own is
-    silent.
+    This is intentionally a stream-copy operation. Video and audio are not
+    re-encoded, so repair is limited primarily by disk I/O rather than codec
+    speed. When ``audio_path`` is supplied, the separate audio rendition is
+    merged into the video in the same lossless-copy pass.
     """
     if not path or not isinstance(path, str):
         send_message({"type": "error", "message": "A file path is required"})
@@ -146,45 +143,28 @@ def run_remux(path, audio_path=None):
             "type": "remuxSkipped",
             "message": f"Audio file not found: {audio_path} — video left silent.",
         })
-
-    # Whichever file will supply the final audio track is what gets measured.
-    audio_source = audio_path if merging else path
-    normalized = False
-    loudnorm_filter = None
-    if has_audio_stream(audio_source):
-        stats = measure_loudness(audio_source)
-        if stats:
-            loudnorm_filter = build_loudnorm_filter(stats)
-            normalized = True
+        return
 
     stem, ext = os.path.splitext(path)
     if ext.lower() not in (".mp4", ".m4v", ".mov"):
         ext = ".mp4"
-    # Stage beside the original: ffmpeg cannot read and write the same path
     tmp = f"{stem}.remux.tmp{ext}"
 
     creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
 
     if merging:
-        # -map picks video from input 0 and audio from input 1; -shortest
-        # guards against a track that runs slightly long.
-        base = [FFMPEG_BIN, "-nostdin", "-v", "error", "-y",
-                "-i", path, "-i", audio_path,
-                "-map", "0:v:0", "-map", "1:a:0"]
-        if loudnorm_filter:
-            cmd = base + ["-c:v", "copy", "-af", loudnorm_filter, "-ar", "48000",
-                          "-c:a", "aac", "-b:a", "192k",
-                          "-movflags", "+faststart", "-shortest", tmp]
-        else:
-            cmd = base + ["-c", "copy", "-movflags", "+faststart", "-shortest", tmp]
+        cmd = [
+            FFMPEG_BIN, "-nostdin", "-v", "error", "-y",
+            "-i", path, "-i", audio_path,
+            "-map", "0:v:0", "-map", "1:a:0",
+            "-c", "copy", "-movflags", "+faststart", "-shortest", tmp,
+        ]
     else:
-        base = [FFMPEG_BIN, "-nostdin", "-v", "error", "-y", "-i", path]
-        if loudnorm_filter:
-            cmd = base + ["-c:v", "copy", "-af", loudnorm_filter, "-ar", "48000",
-                          "-c:a", "aac", "-b:a", "192k",
-                          "-movflags", "+faststart", tmp]
-        else:
-            cmd = base + ["-c", "copy", "-movflags", "+faststart", tmp]
+        cmd = [
+            FFMPEG_BIN, "-nostdin", "-v", "error", "-y",
+            "-i", path,
+            "-c", "copy", "-movflags", "+faststart", tmp,
+        ]
 
     try:
         proc = subprocess.run(
@@ -206,15 +186,8 @@ def run_remux(path, audio_path=None):
 
     ok = proc.returncode == 0 and os.path.isfile(tmp) and os.path.getsize(tmp) > 1024
 
-    # Verify by DURATION, not size: a lossless remux can legitimately shrink
+    # Verify by duration, not size: a lossless remux can legitimately shrink
     # a file substantially, so a size heuristic yields false failures.
-    #
-    # Tolerance is 1% OR 0.5s, whichever is larger — a pure percentage check
-    # is too tight for short clips once loudnorm is in play: re-encoding
-    # audio through AAC adds a small, roughly fixed amount of encoder
-    # priming/padding (observed ~100ms in testing) that shows up as extra
-    # container duration regardless of how long the source is. A genuine
-    # failure (e.g. a truncated remux) differs by far more than this floor.
     if ok:
         d_src, d_out = probe_duration(path), probe_duration(tmp)
         if d_src and d_out:
@@ -227,17 +200,18 @@ def run_remux(path, audio_path=None):
             target = stem + ext
             os.replace(tmp, target)
             if target != path and os.path.isfile(path):
-                os.remove(path)  # container changed
-            # The separate audio file has been folded in; drop the leftover
+                os.remove(path)
             if merging and os.path.isfile(audio_path):
                 try:
                     os.remove(audio_path)
                 except OSError:
                     pass
-            send_message({"type": "remuxed", "path": target,
-                          "bytes": os.path.getsize(target),
-                          "merged": merging,
-                          "normalized": normalized})
+            send_message({
+                "type": "remuxed",
+                "path": target,
+                "bytes": os.path.getsize(target),
+                "merged": merging,
+            })
         except OSError as exc:
             send_message({"type": "error", "message": f"Could not replace file: {exc}"})
     else:
@@ -273,9 +247,12 @@ def main():
             send_message({"type": "error", "message": f"Bad message: {exc}"})
             return
         if message is None:
-            return  # extension closed the port
+            return
 
-        if message.get("action") == "remux":
+        action = message.get("action")
+        if action == "inspect":
+            send_inspection(message.get("path"))
+        elif action == "remux":
             run_remux(message.get("path"), message.get("audioPath"))
         else:
             send_message({"type": "error", "message": "Unsupported native-host action"})
