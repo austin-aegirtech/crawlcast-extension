@@ -1,5 +1,14 @@
 {
   "name": "crawlcast-extension",
   "version": "0.1.0",
-  "private": true
+  "private": true,
+  "scripts": {
+    "prepare": "husky",
+    "commit": "cz"
+  },
+  "config": {
+    "commitizen": {
+      "path": "cz-conventional-changelog"
+    }
+  }
 }
