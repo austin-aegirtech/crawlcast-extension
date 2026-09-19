@@ -9,9 +9,9 @@ const activeDownloads = new Map();
 // downloaded video stays in memory for the life of the offscreen document.
 const pendingBlobUrls = new Map();
 
-// Direct MP4 downloads are owned by chrome.downloads instead of the HLS
+// Direct MP4 and PDF downloads are owned by chrome.downloads instead of the HLS
 // offscreen pipeline. Keep the browser download id mapped back to the
-// detected stream so progress, cancellation, and post-download repair can
+// detected item so progress, cancellation, and MP4 post-download repair can
 // use the same popup UI as HLS downloads.
 const directDownloads = new Map();
 
@@ -151,10 +151,11 @@ function handleDirectDownloadDelta(delta, entry) {
     directDownloads.delete(delta.id);
     activeDownloads.delete(entry.streamUrl);
     persistDirectDownloads();
+    const format = entry.format || getStreamFormat(detectedStreams.get(entry.streamUrl) || entry.streamUrl);
     broadcast({
       action: 'downloadError',
       url: entry.streamUrl,
-      error: delta.error?.current || 'MP4 download interrupted'
+      error: delta.error?.current || `${format ? format.toUpperCase() : 'File'} download interrupted`
     });
     maybeCloseOffscreen();
   }
@@ -166,14 +167,19 @@ function completeDirectDownload(downloadId, entry) {
   activeDownloads.delete(entry.streamUrl);
   persistDirectDownloads();
 
+  const stream = detectedStreams.get(entry.streamUrl);
+  const format = entry.format || getStreamFormat(stream || entry.streamUrl);
+
   broadcast({
     action: 'downloadComplete',
     url: entry.streamUrl,
-    result: { filename: entry.filename }
+    result: { filename: entry.filename, format }
   });
 
-  remuxDownloadedFile(downloadId, entry.streamUrl).catch((e) =>
-    console.log('[Remux] Skipped:', e.message));
+  if (format === 'mp4') {
+    remuxDownloadedFile(downloadId, entry.streamUrl).catch((e) =>
+      console.log('[Remux] Skipped:', e.message));
+  }
   maybeCloseOffscreen();
 }
 
@@ -377,18 +383,57 @@ function persistStreams() {
 }
 
 // Direct media formats Crawlcast can download. HLS keeps its existing
-// playlist pipeline; MP4 uses chrome.downloads directly.
+// playlist pipeline; MP4 and PDF use chrome.downloads directly.
 const M3U8_PATTERN = /\.m3u8(?:$|[?#])/i;
 const MP4_PATTERN = /\.mp4(?:$|[?#])/i;
+const PDF_PATTERN = /\.pdf(?:$|[?#&])/i;
 
 function getStreamFormat(streamOrUrl) {
   if (streamOrUrl && typeof streamOrUrl === 'object' && streamOrUrl.format) {
     return streamOrUrl.format;
   }
   const url = typeof streamOrUrl === 'string' ? streamOrUrl : streamOrUrl?.url || '';
+  if (PDF_PATTERN.test(url)) return 'pdf';
   if (MP4_PATTERN.test(url)) return 'mp4';
   if (M3U8_PATTERN.test(url)) return 'm3u8';
   return null;
+}
+
+function addDetectedItem({ url, timestamp, tabId, type, initiator, format, title }) {
+  let normalizedUrl;
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
+    normalizedUrl = parsed.href;
+  } catch {
+    return false;
+  }
+
+  const existing = detectedStreams.get(normalizedUrl);
+  const normalizedTitle = typeof title === 'string' ? title.trim() : '';
+  if (existing) {
+    if (!existing.title && normalizedTitle) {
+      existing.title = normalizedTitle;
+      return true;
+    }
+    return false;
+  }
+
+  detectedStreams.set(normalizedUrl, {
+    url: normalizedUrl,
+    timestamp: timestamp || Date.now(),
+    tabId,
+    type: type || 'other',
+    initiator: initiator || 'unknown',
+    format,
+    title: normalizedTitle || null
+  });
+
+  if (detectedStreams.size > 50) {
+    const oldestKey = detectedStreams.keys().next().value;
+    detectedStreams.delete(oldestKey);
+  }
+  return true;
 }
 
 // Listen for network requests
@@ -397,26 +442,18 @@ chrome.webRequest.onBeforeRequest.addListener(
     const url = details.url;
     const format = getStreamFormat(url);
 
-    if (detectedStreams.has(url)) return;
     if (!format) return;
 
-    const streamInfo = {
-      url: url,
+    const changed = addDetectedItem({
+      url,
       timestamp: Date.now(),
       tabId: details.tabId,
       type: details.type,
       initiator: details.initiator || 'unknown',
       format,
       title: null // Will be populated from page
-    };
-    
-    detectedStreams.set(url, streamInfo);
-
-    // Limit storage size
-    if (detectedStreams.size > 50) {
-      const oldestKey = detectedStreams.keys().next().value;
-      detectedStreams.delete(oldestKey);
-    }
+    });
+    if (!changed) return;
 
     persistStreams();
     updateBadge(details.tabId);
@@ -424,6 +461,35 @@ chrome.webRequest.onBeforeRequest.addListener(
   },
   { urls: ["<all_urls>"] },
   ["requestBody"]
+);
+
+// Some PDF endpoints do not include .pdf in the URL. Detect a loaded PDF by
+// its response Content-Type so direct documents and embedded viewers still
+// appear even when their URLs are extensionless.
+chrome.webRequest.onHeadersReceived.addListener(
+  (details) => {
+    const contentType = (details.responseHeaders || []).find(
+      (header) => (header.name || '').toLowerCase() === 'content-type'
+    )?.value || '';
+    if (!/^application\/pdf(?:\s*;|$)/i.test(contentType)) return;
+
+    const changed = addDetectedItem({
+      url: details.url,
+      timestamp: Date.now(),
+      tabId: details.tabId,
+      type: details.type,
+      initiator: details.initiator || 'unknown',
+      format: 'pdf',
+      title: null
+    });
+    if (!changed) return;
+
+    persistStreams();
+    updateBadge(details.tabId);
+    console.log('[PDF Detector] Found by Content-Type:', details.url);
+  },
+  { urls: ["<all_urls>"] },
+  ["responseHeaders"]
 );
 
 // Update badge
@@ -475,6 +541,33 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       crawlcastMode = request.mode;
       await chrome.storage.local.set({ crawlcastMode });
       sendResponse({ success: true, ...getModeState() });
+    });
+    return true;
+  }
+
+  // PDF links are discovered on demand from the active page by popup.js.
+  // Persist them beside network-detected media so popup closes and service
+  // worker restarts do not discard the scan result.
+  if (request.action === 'addPagePdfs') {
+    streamsRestored.then(() => {
+      let changed = false;
+      for (const pdf of (request.pdfs || [])) {
+        changed = addDetectedItem({
+          url: pdf.url,
+          timestamp: Date.now(),
+          tabId: request.tabId,
+          type: pdf.type || 'page',
+          initiator: request.pageUrl || 'page-scan',
+          format: 'pdf',
+          title: pdf.title
+        }) || changed;
+      }
+
+      if (changed) {
+        persistStreams();
+        updateBadge(request.tabId);
+      }
+      sendResponse({ success: true });
     });
     return true;
   }
@@ -688,9 +781,9 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       const targets = (request.urls || []).filter((url) => {
         const s = detectedStreams.get(url);
         if (!s || thumbnailJobs.has(url)) return false;
-        // Direct MP4s do not need the HLS parser/thumbnail pipeline. They
-        // download straight through chrome.downloads and use a placeholder.
-        if (getStreamFormat(s) === 'mp4') return false;
+        // Only HLS uses the parser/thumbnail pipeline. Direct MP4 and PDF
+        // files download through chrome.downloads and use placeholders.
+        if (getStreamFormat(s) !== 'm3u8') return false;
         // The same job produces both the preview and the size metadata,
         // so run it if either is still missing and hasn't already failed
         return (!s.thumbnail && !s.thumbnailTried) || (!s.meta && !s.metaTried);
@@ -782,17 +875,20 @@ function broadcast(message) {
 }
 
 /**
- * Start a detected video using the pipeline appropriate to its format.
- * HLS remains in the offscreen downloader; direct MP4s are handed to the
- * browser downloads API and repaired after the file is fully written.
+ * Start a detected item using the pipeline appropriate to its format.
+ * HLS remains in the offscreen downloader; direct MP4 and PDF files are
+ * handed to the browser downloads API. Only MP4 is inspected/remuxed.
  */
 async function startDownload(url, filename, tabId) {
   const stream = detectedStreams.get(url);
   const format = getStreamFormat(stream || url);
 
-  if (format === 'mp4') {
-    return startDirectMp4Download(url, filename || 'video.mp4');
+  if (format === 'mp4' || format === 'pdf') {
+    const fallbackName = format === 'pdf' ? 'document.pdf' : 'video.mp4';
+    return startDirectDownload(url, filename || fallbackName, format);
   }
+
+  if (format !== 'm3u8') throw new Error('Unsupported download format');
 
   // Register before the await so maybeCloseOffscreen() can't close
   // the document out from under a download that's about to start
@@ -811,7 +907,7 @@ async function startDownload(url, filename, tabId) {
   }).catch((err) => console.error('[Offscreen] send failed:', err));
 }
 
-async function startDirectMp4Download(url, filename) {
+async function startDirectDownload(url, filename, format) {
   activeDownloads.set(url, {
     kind: 'direct',
     progress: {
@@ -832,6 +928,7 @@ async function startDirectMp4Download(url, filename) {
     const entry = {
       streamUrl: url,
       filename,
+      format,
       bytesReceived: 0,
       totalBytes: 0,
       startTime: Date.now()
@@ -855,7 +952,7 @@ async function startDirectMp4Download(url, filename) {
         directDownloads.delete(downloadId);
         activeDownloads.delete(url);
         persistDirectDownloads();
-        throw new Error(item.error || 'MP4 download interrupted');
+        throw new Error(item.error || `${format.toUpperCase()} download interrupted`);
       } else {
         handleDirectDownloadDelta({
           id: downloadId,

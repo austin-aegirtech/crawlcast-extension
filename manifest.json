@@ -2,11 +2,12 @@
   "manifest_version": 3,
   "name": "Crawlcast",
   "version": "0.1.0",
-  "description": "Detect and download HLS streams and direct MP4 video from the web.",
+  "description": "Detect and download HLS streams, direct MP4 video, and PDF documents from web pages.",
   "permissions": [
     "webRequest",
     "storage",
     "activeTab",
+    "scripting",
     "downloads",
     "offscreen",
     "nativeMessaging"

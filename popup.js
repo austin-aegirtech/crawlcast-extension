@@ -36,6 +36,7 @@ function initAppHandlers() {
   document.getElementById('logClose').addEventListener('click', () => setLogsOpen(false));
   document.getElementById('logRefresh').addEventListener('click', loadLogs);
   document.getElementById('logCopy').addEventListener('click', copyLogs);
+  document.getElementById('logDownload').addEventListener('click', downloadLogs);
   document.getElementById('logClear').addEventListener('click', async () => {
     await chrome.runtime.sendMessage({ action: 'clearLogs' });
     loadLogs();
@@ -105,7 +106,7 @@ function initAppHandlers() {
 
 async function loadModeState() {
   const response = await chrome.runtime.sendMessage({ action: 'getModeState' }).catch(() => null);
-  if (response?.success) applyModeState(response);
+  applyModeState(response?.success ? response : { mode: 'user', nextAllowedAt: 0 });
 }
 
 async function toggleMode() {
@@ -130,11 +131,13 @@ function applyModeState(state) {
 
   const button = document.getElementById('modeToggle');
   const label = document.getElementById('modeLabel');
+  const premiumCard = document.getElementById('premiumCard');
   const isGodMode = currentMode === 'god';
 
   button.classList.toggle('god', isGodMode);
   button.setAttribute('aria-pressed', String(isGodMode));
   label.textContent = isGodMode ? 'God Mode' : 'User Mode';
+  premiumCard.hidden = isGodMode;
 
   if (isGodMode) {
     button.title = 'God Mode — unlimited downloads';
@@ -213,6 +216,8 @@ async function loadStreams() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   currentPageTitle = tab.title || '';
 
+  await scanPageForPdfs(tab);
+
   const response = await chrome.runtime.sendMessage({
     action: 'getStreams',
     tabId: tab.id
@@ -222,7 +227,7 @@ async function loadStreams() {
 
   // Lazily request thumbnails for streams that don't have one cached yet
   const missing = (response.streams || [])
-    .filter(s => getStreamFormat(s) !== 'mp4')
+    .filter(s => getStreamFormat(s) === 'm3u8')
     .filter(s => (!s.thumbnail && !s.thumbnailTried) || (!s.meta && !s.metaTried))
     .map(s => s.url);
   if (missing.length > 0) {
@@ -234,6 +239,87 @@ async function loadStreams() {
   }
 }
 
+async function scanPageForPdfs(tab) {
+  if (!tab?.id || !/^https?:/i.test(tab.url || '')) return;
+
+  const results = await chrome.scripting.executeScript({
+    target: { tabId: tab.id },
+    func: findPdfLinksInPage
+  }).catch(() => []);
+  const pdfs = Array.isArray(results?.[0]?.result) ? results[0].result : [];
+  if (!pdfs.length) return;
+
+  await chrome.runtime.sendMessage({
+    action: 'addPagePdfs',
+    tabId: tab.id,
+    pageUrl: tab.url,
+    pdfs
+  }).catch(() => {});
+}
+
+// Runs inside the active page through chrome.scripting.executeScript.
+// Keep this function self-contained because Chrome serializes it.
+function findPdfLinksInPage() {
+  const found = new Map();
+  const pdfPattern = /\.pdf(?:$|[?#&])/i;
+
+  const addCandidate = (rawUrl, rawTitle, declaredType, sourceType) => {
+    if (!rawUrl) return;
+
+    let parsed;
+    try {
+      parsed = new URL(rawUrl, document.baseURI);
+    } catch {
+      return;
+    }
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return;
+
+    const mediaType = String(declaredType || '').split(';')[0].trim().toLowerCase();
+    if (mediaType !== 'application/pdf' && !pdfPattern.test(parsed.href)) return;
+
+    parsed.hash = '';
+    const url = parsed.href;
+    let title = String(rawTitle || '').replace(/\s+/g, ' ').trim();
+
+    if (!title || /^(download|open|view|pdf|document)$/i.test(title)) {
+      const lastPathPart = parsed.pathname.split('/').filter(Boolean).pop() || '';
+      try {
+        title = decodeURIComponent(lastPathPart).replace(/\.pdf$/i, '').replace(/[-_]+/g, ' ').trim();
+      } catch {
+        title = lastPathPart.replace(/\.pdf$/i, '').replace(/[-_]+/g, ' ').trim();
+      }
+    }
+
+    const existing = found.get(url);
+    if (!existing || (!existing.title && title)) {
+      found.set(url, { url, title: title || null, type: sourceType });
+    }
+  };
+
+  document.querySelectorAll('a[href]').forEach((element) => {
+    addCandidate(
+      element.href,
+      element.getAttribute('aria-label') || element.title || element.download || element.textContent,
+      element.type || (/\.pdf$/i.test(element.download || '') ? 'application/pdf' : ''),
+      'link'
+    );
+  });
+  document.querySelectorAll('embed[src]').forEach((element) => {
+    addCandidate(element.src, element.title, element.type, 'embed');
+  });
+  document.querySelectorAll('object[data]').forEach((element) => {
+    addCandidate(element.data, element.title, element.type, 'object');
+  });
+  document.querySelectorAll('iframe[src]').forEach((element) => {
+    addCandidate(element.src, element.title, '', 'iframe');
+  });
+  document.querySelectorAll('link[href][type]').forEach((element) => {
+    addCandidate(element.href, element.title, element.type, 'link');
+  });
+
+  return Array.from(found.values());
+}
+
 function renderStreams(streams, tabId, pageTitle = currentPageTitle) {
   const listEl = document.getElementById('streamList');
   const countEl = document.getElementById('streamCount');
@@ -242,10 +328,10 @@ function renderStreams(streams, tabId, pageTitle = currentPageTitle) {
 
   countEl.textContent = streams.length;
   toolbarStatus.textContent = streams.length === 0
-    ? 'Ready — no streams detected'
-    : `Ready — ${streams.length} stream${streams.length === 1 ? '' : 's'} detected`;
+    ? 'Ready — no media detected'
+    : `Ready — ${streams.length} item${streams.length === 1 ? '' : 's'} detected`;
   sectionSummary.textContent = streams.length === 0
-    ? 'Waiting for video…'
+    ? 'Waiting for video or PDFs…'
     : `${streams.length} available`;
 
   if (streams.length === 0) {
@@ -256,8 +342,8 @@ function renderStreams(streams, tabId, pageTitle = currentPageTitle) {
           <circle cx="12" cy="12" r="4"/>
           <path d="M12 8v8M8 12h8"/>
         </svg>
-        <strong>No video streams detected</strong>
-        <span>Play a video on this page and Crawlcast will detect available streams.</span>
+        <strong>No downloadable media found</strong>
+        <span>Play a video or open a page containing PDF links.</span>
       </div>
     `;
     return;
@@ -277,13 +363,14 @@ function renderStreams(streams, tabId, pageTitle = currentPageTitle) {
       thumbFrames.set(stream.url, stream.frames);
     }
 
+    const streamFormat = getStreamFormat(stream);
+    const placeholderIcon = streamFormat === 'pdf' ? '📄' : '🎬';
     const thumb = stream.thumbnail
       ? `<img class="stream-thumb" src="${stream.thumbnail}" data-url="${escapeHtml(stream.url)}" alt="">`
-      : `<div class="stream-thumb stream-thumb-placeholder" id="thumb-${hash}">🎬</div>`;
+      : `<div class="stream-thumb stream-thumb-placeholder" id="thumb-${hash}">${placeholderIcon}</div>`;
 
     const requestType = formatRequestType(stream.type);
-    const streamFormat = getStreamFormat(stream);
-    const formatLabel = streamFormat === 'mp4' ? 'MP4' : 'M3U8';
+    const formatLabel = streamFormat === 'pdf' ? 'PDF' : (streamFormat === 'mp4' ? 'MP4' : 'M3U8');
 
     return `
       <article class="stream-item" data-url="${escapeHtml(stream.url)}">
@@ -306,6 +393,7 @@ function renderStreams(streams, tabId, pageTitle = currentPageTitle) {
                 class="stream-title ${isDownloading || isComplete ? 'title-locked' : ''}"
                 id="title-${hash}"
                 data-url="${escapeHtml(stream.url)}"
+                data-format="${streamFormat}"
                 data-fallback-title="${escapeHtml(pageTitle || '')}"
                 title="${escapeHtml(displayTitle)}"
               >
@@ -342,6 +430,7 @@ function renderStreams(streams, tabId, pageTitle = currentPageTitle) {
                 id="download-${hash}"
                 data-url="${escapeHtml(stream.url)}"
                 data-tab="${tabId}"
+                data-format="${streamFormat}"
                 data-state="${isComplete ? 'complete' : (isDownloading ? 'downloading' : 'idle')}"
                 type="button"
                 ${isDownloading || isComplete || isRateLimited ? 'disabled' : ''}
@@ -367,7 +456,11 @@ function renderStreams(streams, tabId, pageTitle = currentPageTitle) {
   }).join('');
 
   document.querySelectorAll('.download-btn').forEach(btn => {
-    btn.addEventListener('click', () => startDownload(btn.dataset.url, btn.dataset.tab));
+    btn.addEventListener('click', () => startDownload(
+      btn.dataset.url,
+      btn.dataset.tab,
+      btn.dataset.format
+    ));
   });
 
   document.querySelectorAll('.cancel-btn').forEach(btn => {
@@ -400,6 +493,7 @@ function beginTitleEdit(url) {
   const textEl = titleEl.querySelector('.stream-title-text');
   const originalTitle = textEl?.textContent?.trim() || '';
   const fallbackTitle = titleEl.dataset.fallbackTitle || currentPageTitle || '';
+  const defaultTitle = getDefaultTitle(titleEl.dataset.format);
 
   const input = document.createElement('input');
   input.className = 'stream-title-input';
@@ -420,7 +514,7 @@ function beginTitleEdit(url) {
     finished = true;
 
     const requestedTitle = save ? input.value.trim() : originalTitle;
-    let displayTitle = requestedTitle || fallbackTitle.trim() || 'Detected HLS stream';
+    let displayTitle = requestedTitle || fallbackTitle.trim() || defaultTitle;
 
     if (save) {
       const response = await chrome.runtime.sendMessage({
@@ -430,7 +524,7 @@ function beginTitleEdit(url) {
       }).catch(() => null);
 
       if (!response?.success) {
-        displayTitle = originalTitle || fallbackTitle.trim() || 'Detected HLS stream';
+        displayTitle = originalTitle || fallbackTitle.trim() || defaultTitle;
         setStatus(url, 'status-error', '❌ Could not save title');
       }
     }
@@ -529,10 +623,10 @@ function attachThumbHover(img) {
   });
 }
 
-async function startDownload(url, tabId) {
+async function startDownload(url, tabId, format) {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   currentPageTitle = tab?.title || currentPageTitle;
-  const filename = buildDownloadFilename(getCardTitle(url));
+  const filename = buildDownloadFilename(getCardTitle(url), format);
 
   // Ask the background worker first. User Mode is enforced there so popup
   // closes/reopens cannot reset or bypass the rolling-hour limit.
@@ -630,6 +724,13 @@ function setStatus(url, className, text) {
 }
 
 function onDownloadComplete(url, result) {
+  const format = result?.format || getStreamFormat(url);
+  if (format === 'pdf') {
+    markDownloadComplete(url);
+    setStatus(url, 'status-success', `✅ Saved ${result.filename}`);
+    return;
+  }
+
   // chrome.downloads has accepted the file. Direct MP4s are inspected first
   // and skip the remux entirely when already optimized; HLS output still
   // needs the normal fast stream-copy repair.
@@ -753,14 +854,37 @@ function renderLogs() {
 }
 
 function copyLogs() {
-  const text = logCache.map(e =>
-    `${new Date(e.ts).toISOString()} [${e.level.toUpperCase()}] ${e.source}: ${e.message}`
-  ).join('\n');
-
-  navigator.clipboard.writeText(text || '(no entries)');
+  navigator.clipboard.writeText(formatLogs());
   const btn = document.getElementById('logCopy');
   btn.textContent = 'Copied ✓';
   setTimeout(() => (btn.textContent = 'Copy all'), 1500);
+}
+
+function formatLogs() {
+  return logCache.map(e =>
+    `${new Date(e.ts).toISOString()} [${e.level.toUpperCase()}] ${e.source}: ${e.message}`
+  ).join('\n') || '(no entries)';
+}
+
+async function downloadLogs() {
+  await loadLogs();
+
+  const blob = new Blob([`${formatLogs()}\n`], { type: 'text/plain;charset=utf-8' });
+  const blobUrl = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+
+  link.href = blobUrl;
+  link.download = `crawlcast-logs-${timestamp}.txt`;
+  link.hidden = true;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
+
+  const btn = document.getElementById('logDownload');
+  btn.textContent = 'Downloaded ✓';
+  setTimeout(() => (btn.textContent = 'Download'), 1500);
 }
 
 
@@ -800,18 +924,30 @@ function updateDurationBadge(url, meta) {
 function getStreamTitle(stream, pageTitle) {
   const title = (stream?.title || pageTitle || '').trim();
   if (title) return title;
-  return getStreamFormat(stream) === 'mp4' ? 'Detected MP4 video' : 'Detected HLS stream';
+  return getDefaultTitle(getStreamFormat(stream));
+}
+
+function getDefaultTitle(format) {
+  if (format === 'pdf') return 'Detected PDF document';
+  if (format === 'mp4') return 'Detected MP4 video';
+  return 'Detected HLS stream';
 }
 
 function getStreamFormat(stream) {
-  if (stream?.format === 'mp4' || stream?.format === 'm3u8') return stream.format;
+  if (stream?.format === 'pdf' || stream?.format === 'mp4' || stream?.format === 'm3u8') {
+    return stream.format;
+  }
   const url = typeof stream === 'string' ? stream : (stream?.url || '');
+  if (/\.pdf(?:$|[?#&])/i.test(url)) return 'pdf';
   return /\.mp4(?:$|[?#])/i.test(url) ? 'mp4' : 'm3u8';
 }
 
 function formatRequestType(type) {
   if (!type) return '';
   if (type === 'xmlhttprequest') return 'XHR';
+  if (type === 'link' || type === 'embed' || type === 'object' || type === 'iframe') {
+    return type.toUpperCase();
+  }
   return type;
 }
 
@@ -823,11 +959,13 @@ function getHostname(url) {
   }
 }
 
-function buildDownloadFilename(title) {
+function buildDownloadFilename(title, format = 'm3u8') {
+  const extension = format === 'pdf' ? 'pdf' : 'mp4';
+  const fallbackPrefix = format === 'pdf' ? 'document' : 'video';
   let base = (title || '').trim();
 
-  // Avoid duplicate extensions when a page title already ends in a video extension.
-  base = base.replace(/\.(mp4|m4v|mov|mkv|webm)$/i, '');
+  // Avoid duplicate extensions when a title already ends in a supported file extension.
+  base = base.replace(/\.(pdf|mp4|m4v|mov|mkv|webm)$/i, '');
 
   // Windows-invalid filename characters plus ASCII control characters.
   base = base
@@ -836,15 +974,15 @@ function buildDownloadFilename(title) {
     .replace(/[. ]+$/g, '')
     .trim();
 
-  if (!base) return `video_${Date.now()}.mp4`;
+  if (!base) return `${fallbackPrefix}_${Date.now()}.${extension}`;
 
   if (/^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i.test(base)) {
-    base = `video_${base}`;
+    base = `${fallbackPrefix}_${base}`;
   }
 
   // Leave room for the extension and keep the filename comfortably below OS path limits.
   base = base.slice(0, 180).replace(/[. ]+$/g, '').trim();
-  return base ? `${base}.mp4` : `video_${Date.now()}.mp4`;
+  return base ? `${base}.${extension}` : `${fallbackPrefix}_${Date.now()}.${extension}`;
 }
 
 // In-browser downloads buffer everything in memory. Keep in sync with
@@ -854,6 +992,7 @@ const MEMORY_LIMIT_BYTES = 1.5e9;
 /** Size / duration / quality line for a stream card */
 function renderSize(meta, format = 'm3u8') {
   if (!meta) {
+    if (format === 'pdf') return '<span class="size-pending">Direct PDF</span>';
     return format === 'mp4'
       ? '<span class="size-pending">Direct MP4</span>'
       : '<span class="size-pending">Analyzing…</span>';
