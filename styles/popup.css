@@ -15,8 +15,11 @@
   --text: #f3f3f4;
   --muted: #a8a9ae;
   --muted-2: #777980;
-  --accent: #5fa7df;
-  --accent-hover: #72b5e8;
+  --accent: #0284c7;
+  --accent-hover: #0ea5e9;
+  --brand-soft: rgba(2, 132, 199, 0.12);
+  --brand-border: rgba(2, 132, 199, 0.48);
+  --brand-glow: rgba(2, 132, 199, 0.52);
   --success: #72c777;
   --warning: #e2b950;
   --danger: #ef6a64;
@@ -130,9 +133,9 @@ button:disabled {
 }
 
 .mode-toggle.god {
-  color: #e2c8ff;
-  background: #352942;
-  border-color: #69498a;
+  color: var(--accent);
+  background: var(--brand-soft);
+  border-color: var(--brand-border);
 }
 
 .mode-track {
@@ -156,7 +159,7 @@ button:disabled {
 }
 
 .mode-toggle.god .mode-track {
-  background: #8157aa;
+  background: var(--accent);
 }
 
 .mode-toggle.god .mode-knob {
@@ -285,10 +288,10 @@ button:disabled {
   align-items: center;
   gap: 7px;
   padding: 6px 9px;
-  border: 1px solid #69498a;
+  border: 1px solid var(--brand-border);
   border-radius: 999px;
-  background: #352942;
-  color: #e2c8ff;
+  background: var(--brand-soft);
+  color: var(--accent);
   font-size: 11px;
   font-weight: 650;
   line-height: 1;
@@ -304,12 +307,12 @@ button:disabled {
   height: 6px;
   flex: 0 0 6px;
   border-radius: 50%;
-  background: #8157aa;
-  box-shadow: 0 0 8px rgba(129, 87, 170, 0.8);
+  background: var(--accent);
+  box-shadow: 0 0 8px var(--brand-glow);
 }
 
 .premium-limit-countdown strong {
-  color: #e2c8ff;
+  color: var(--accent);
   font-variant-numeric: tabular-nums;
   letter-spacing: 0.03em;
 }
@@ -546,7 +549,7 @@ img.stream-thumb {
 .stream-title:hover .title-edit-btn,
 .title-edit-btn:focus-visible {
   color: var(--accent);
-  background: rgba(129, 87, 170, 0.14);
+  background: var(--brand-soft);
   opacity: 1;
 }
 
@@ -558,14 +561,14 @@ img.stream-thumb {
   width: 100%;
   min-width: 0;
   padding: 5px 8px;
-  border: 1px solid #8157aa;
+  border: 1px solid var(--accent);
   border-radius: 6px;
   outline: none;
   background: #17181c;
   color: #f0f0f2;
   font: inherit;
   line-height: 1.35;
-  box-shadow: 0 0 0 2px rgba(129, 87, 170, 0.14);
+  box-shadow: 0 0 0 2px var(--brand-soft);
 }
 
 .stream-meta {
@@ -973,9 +976,9 @@ img.stream-thumb {
 }
 
 .toolbar-button.active {
-  color: #a8d7f7;
-  background: #283640;
-  border-color: #486679;
+  color: var(--accent);
+  background: var(--brand-soft);
+  border-color: var(--brand-border);
 }
 
 .toolbar-icon {
