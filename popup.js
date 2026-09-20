@@ -90,6 +90,26 @@ function initAppHandlers() {
         '⚠️ Saved, but not repaired (ffmpeg/native host unavailable). ' +
         'Playback may start slowly and seeking may be limited.');
     }
+    if (message.action === 'audioExtractionStarted') {
+      const label = String(message.format || '').toUpperCase();
+      setDownloadStage(message.url, `Extracting ${label} audio…`, 100);
+      setStatus(message.url, 'status-success', `🎵 Creating ${label} audio file…`);
+    }
+    if (message.action === 'audioDownloadComplete') {
+      markAudioDownloadComplete(message.url);
+      const label = String(message.format || '').toUpperCase();
+      setStatus(
+        message.url,
+        message.sourceRemoved === false ? 'status-warn' : 'status-success',
+        message.sourceRemoved === false
+          ? `⚠️ Saved ${message.filename || label + ' audio'}; temporary source file could not be removed.`
+          : `✅ Saved ${message.filename || label + ' audio'}`
+      );
+    }
+    if (message.action === 'audioDownloadError') {
+      markAudioDownloadFailed(message.url);
+      setStatus(message.url, 'status-error', `❌ ${message.error || 'Audio extraction failed'}`);
+    }
     if (message.action === 'streamMeta') {
       // Metadata arrives independently of the thumbnail — patch it in without a re-render.
       const el = document.getElementById(`size-${hashCode(message.url)}`);
@@ -298,7 +318,7 @@ function updateRateLimitCountdown() {
 
   indicator.hidden = !limited;
 
-  document.querySelectorAll('.download-btn').forEach((button) => {
+  document.querySelectorAll('.download-btn, .audio-download-btn').forEach((button) => {
     const isIdle = button.dataset.state === 'idle';
     if (limited) {
       if (isIdle) button.disabled = true;
@@ -544,6 +564,28 @@ function renderStreams(streams, tabId, pageTitle = currentPageTitle) {
 
             <div class="card-actions">
               ${isDownloading ? `<button class="cancel-btn" id="cancel-${hash}" data-url="${escapeHtml(stream.url)}" type="button">Cancel</button>` : ''}
+              ${streamFormat === 'pdf' ? '' : `
+                <div class="audio-download-controls">
+                  <select
+                    class="audio-format-select"
+                    id="audio-format-${hash}"
+                    aria-label="Audio format"
+                    ${isDownloading || isComplete ? 'disabled' : ''}
+                  >
+                    <option value="m4a">M4A</option>
+                    <option value="mp3">MP3</option>
+                  </select>
+                  <button
+                    class="audio-download-btn"
+                    id="audio-${hash}"
+                    data-url="${escapeHtml(stream.url)}"
+                    data-tab="${tabId}"
+                    data-state="${isComplete ? 'complete' : (isDownloading ? 'downloading' : 'idle')}"
+                    type="button"
+                    ${isDownloading || isComplete || isRateLimited ? 'disabled' : ''}
+                  >Audio only</button>
+                </div>
+              `}
               <div class="download-controls">
                 <button
                   class="download-btn"
@@ -592,6 +634,13 @@ function renderStreams(streams, tabId, pageTitle = currentPageTitle) {
       btn.dataset.url,
       btn.dataset.tab,
       btn.dataset.format
+    ));
+  });
+
+  document.querySelectorAll('.audio-download-btn').forEach(btn => {
+    btn.addEventListener('click', () => startAudioDownload(
+      btn.dataset.url,
+      btn.dataset.tab
     ));
   });
 
@@ -889,6 +938,43 @@ async function startDownload(url, tabId, format) {
   renderStreams(response.streams || [], tab.id, currentPageTitle);
 }
 
+async function startAudioDownload(url, tabId) {
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  currentPageTitle = tab?.title || currentPageTitle;
+  const hash = hashCode(url);
+  const audioFormat = document.getElementById(`audio-format-${hash}`)?.value === 'mp3'
+    ? 'mp3'
+    : 'm4a';
+  const filename = buildAudioFilename(getCardTitle(url), audioFormat);
+
+  const startResult = await chrome.runtime.sendMessage({
+    action: 'startDownload',
+    url,
+    filename,
+    audioFormat,
+    tabId: parseInt(tabId)
+  });
+
+  if (startResult?.mode) applyModeState(startResult);
+  if (!startResult?.success) {
+    if (startResult?.reason === 'rate_limit') {
+      setStatus(
+        url,
+        'status-warn',
+        `⏱️ User Mode allows 1 download per hour. Try again in ${formatRemainingTime(startResult.remainingMs)}.`
+      );
+      return;
+    }
+    setStatus(url, 'status-error', `❌ ${startResult?.error || 'Could not start audio download'}`);
+    return;
+  }
+
+  completedDownloadsUI.delete(url);
+  activeDownloadsUI.set(url, { startTime: Date.now(), audioFormat });
+  const response = await chrome.runtime.sendMessage({ action: 'getStreams', tabId: tab.id });
+  renderStreams(response.streams || [], tab.id, currentPageTitle);
+}
+
 function updateDownloadProgress(url, progress) {
   const hash = hashCode(url);
   const container = document.getElementById(`progress-${hash}`);
@@ -1063,6 +1149,62 @@ function markDownloadComplete(url) {
     btn.disabled = true;
     btn.innerHTML = '<span class="download-icon">✓</span><span>Complete!</span>';
   }
+  const audioBtn = document.getElementById(`audio-${hash}`);
+  if (audioBtn) {
+    audioBtn.dataset.state = 'complete';
+    audioBtn.disabled = true;
+    audioBtn.textContent = 'Complete!';
+  }
+}
+
+function markAudioDownloadComplete(url) {
+  activeDownloadsUI.delete(url);
+  completedDownloadsUI.delete(url);
+  setDownloadStage(url, 'Audio complete', 100);
+
+  const hash = hashCode(url);
+  document.getElementById(`cancel-${hash}`)?.remove();
+  document.getElementById(`pause-${hash}`)?.remove();
+
+  const videoBtn = document.getElementById(`download-${hash}`);
+  if (videoBtn) {
+    videoBtn.dataset.state = 'idle';
+    videoBtn.disabled = isUserModeRateLimited();
+    videoBtn.innerHTML = '<span class="download-icon">↓</span><span>Download</span>';
+  }
+
+  const audioBtn = document.getElementById(`audio-${hash}`);
+  const audioSelect = document.getElementById(`audio-format-${hash}`);
+  if (audioBtn) {
+    audioBtn.dataset.state = 'idle';
+    audioBtn.disabled = isUserModeRateLimited();
+    audioBtn.textContent = 'Saved!';
+    setTimeout(() => { audioBtn.textContent = 'Audio only'; }, 1800);
+  }
+  if (audioSelect) audioSelect.disabled = false;
+}
+
+function markAudioDownloadFailed(url) {
+  activeDownloadsUI.delete(url);
+  completedDownloadsUI.delete(url);
+  setDownloadStage(url, 'Audio extraction failed', 100);
+
+  const hash = hashCode(url);
+  document.getElementById(`cancel-${hash}`)?.remove();
+  document.getElementById(`pause-${hash}`)?.remove();
+
+  for (const button of [
+    document.getElementById(`download-${hash}`),
+    document.getElementById(`audio-${hash}`)
+  ]) {
+    if (!button) continue;
+    button.dataset.state = 'idle';
+    button.disabled = isUserModeRateLimited();
+  }
+  const audioBtn = document.getElementById(`audio-${hash}`);
+  if (audioBtn) audioBtn.textContent = 'Audio only';
+  const audioSelect = document.getElementById(`audio-format-${hash}`);
+  if (audioSelect) audioSelect.disabled = false;
 }
 
 function markRepairSkipped(url) {
@@ -1303,6 +1445,11 @@ function buildDownloadFilename(title, format = 'm3u8') {
   // Leave room for the extension and keep the filename comfortably below OS path limits.
   base = base.slice(0, 180).replace(/[. ]+$/g, '').trim();
   return base ? `${base}.${extension}` : `${fallbackPrefix}_${Date.now()}.${extension}`;
+}
+
+function buildAudioFilename(title, audioFormat) {
+  const extension = audioFormat === 'mp3' ? 'mp3' : 'm4a';
+  return buildDownloadFilename(title, 'mp4').replace(/\.mp4$/i, `.${extension}`);
 }
 
 // In-browser downloads buffer everything in memory. Keep in sync with
