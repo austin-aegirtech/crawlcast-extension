@@ -41,6 +41,20 @@ chrome.runtime.onMessage.addListener((request) => {
     startDownload(request.url, request.filename);
   }
 
+  if (request.action === 'pauseDownload') {
+    const downloader = runningDownloads.get(request.url);
+    if (downloader?.pause()) {
+      console.log('[Downloader] Paused:', request.url);
+    }
+  }
+
+  if (request.action === 'resumeDownload') {
+    const downloader = runningDownloads.get(request.url);
+    if (downloader?.resume()) {
+      console.log('[Downloader] Resumed:', request.url);
+    }
+  }
+
   // Abort an in-flight download and drop its buffered chunks
   if (request.action === 'cancelDownload') {
     const downloader = runningDownloads.get(request.url);
