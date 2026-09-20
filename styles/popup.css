@@ -458,6 +458,16 @@ img.stream-thumb {
   transition: transform 0.3s ease, filter 0.3s ease;
 }
 
+video.direct-mp4-preview {
+  pointer-events: none;
+  transition: transform 0.3s ease, filter 0.3s ease;
+}
+
+.stream-thumb-wrap:hover video.direct-mp4-preview {
+  transform: scale(1.035);
+  filter: brightness(1.08);
+}
+
 .stream-thumb-wrap:hover img.stream-thumb {
   transform: scale(1.035);
   filter: brightness(1.08);

@@ -124,6 +124,16 @@ async function generateThumbnail(url) {
   const segments = playlist.segments;
   if (segments.length === 0) throw new Error('Playlist has no segments');
 
+  // CMAF/fMP4 media fragments do not contain the codec metadata required for
+  // standalone playback. Fetch EXT-X-MAP once and prepend it to each sampled
+  // fragment before asking the video element to decode a thumbnail.
+  let initSegmentBytes = null;
+  if (playlist.initSegmentUrl) {
+    const initResp = await fetch(playlist.initSegmentUrl);
+    if (!initResp.ok) throw new Error(`HTTP ${initResp.status} fetching init segment`);
+    initSegmentBytes = new Uint8Array(await initResp.arrayBuffer());
+  }
+
   // Publish size/duration as soon as they're known — useful long before the
   // thumbnail renders, and it survives a thumbnail failure.
   const durationSeconds = segments.reduce((sum, s) => sum + (s.duration || 0), 0);
@@ -151,7 +161,7 @@ async function generateThumbnail(url) {
   let sampledCount = 0;
   for (const idx of indices) {
     try {
-      const result = await captureSegmentFrame(segments[idx].url);
+      const result = await captureSegmentFrame(segments[idx].url, initSegmentBytes);
       frames.push(result.frame);
       sampledBytes += result.byteLength;
       sampledCount++;
@@ -179,7 +189,7 @@ function sendMeta(url, meta) {
  * Fetch one segment, transmux it standalone, and snapshot its middle frame
  * @returns {Promise<{frame: string, byteLength: number}>}
  */
-async function captureSegmentFrame(segUrl) {
+async function captureSegmentFrame(segUrl, initSegmentBytes = null) {
   const resp = await fetch(segUrl);
   if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
   const buf = await resp.arrayBuffer();
@@ -189,7 +199,9 @@ async function captureSegmentFrame(segUrl) {
   // which is required since these segments aren't contiguous.
   const view = new Uint8Array(buf);
   const isTS = view[0] === 0x47 && view[188] === 0x47;
-  const mp4Bytes = isTS ? await transmuxOnce(buf) : view;
+  const mp4Bytes = isTS
+    ? await transmuxOnce(buf)
+    : (initSegmentBytes ? concatBytes(initSegmentBytes, view) : view);
 
   const blobUrl = URL.createObjectURL(new Blob([mp4Bytes], { type: 'video/mp4' }));
   try {
@@ -198,6 +210,13 @@ async function captureSegmentFrame(segUrl) {
   } finally {
     URL.revokeObjectURL(blobUrl);
   }
+}
+
+function concatBytes(first, second) {
+  const combined = new Uint8Array(first.byteLength + second.byteLength);
+  combined.set(first, 0);
+  combined.set(second, first.byteLength);
+  return combined;
 }
 
 /** One-shot TS → fMP4 transmux (fresh transmuxer, includes init segment) */

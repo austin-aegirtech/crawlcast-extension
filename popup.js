@@ -339,7 +339,9 @@ async function loadStreams() {
   // Lazily request thumbnails for streams that don't have one cached yet
   const missing = (response.streams || [])
     .filter(s => getStreamFormat(s) === 'm3u8')
-    .filter(s => (!s.thumbnail && !s.thumbnailTried) || (!s.meta && !s.metaTried))
+    .filter(s => (
+      !s.thumbnail && (Number(s.thumbnailAttempts) || 0) < 3
+    ) || (!s.meta && !s.metaTried))
     .map(s => s.url);
   if (missing.length > 0) {
     chrome.runtime.sendMessage({
@@ -482,7 +484,9 @@ function renderStreams(streams, tabId, pageTitle = currentPageTitle) {
     const placeholderIcon = streamFormat === 'pdf' ? '📄' : '🎬';
     const thumb = stream.thumbnail
       ? `<img class="stream-thumb" src="${stream.thumbnail}" data-url="${escapeHtml(stream.url)}" alt="">`
-      : `<div class="stream-thumb stream-thumb-placeholder" id="thumb-${hash}">${placeholderIcon}</div>`;
+      : (streamFormat === 'mp4'
+        ? `<video class="stream-thumb direct-mp4-preview" data-url="${escapeHtml(stream.url)}" src="${escapeHtml(stream.url)}" muted playsinline preload="metadata" aria-label="Video preview"></video>`
+        : `<div class="stream-thumb stream-thumb-placeholder" id="thumb-${hash}">${placeholderIcon}</div>`);
 
     const requestType = formatRequestType(stream.type);
     const formatLabel = streamFormat === 'pdf' ? 'PDF' : (streamFormat === 'mp4' ? 'MP4' : 'M3U8');
@@ -617,6 +621,7 @@ function renderStreams(streams, tabId, pageTitle = currentPageTitle) {
   });
 
   document.querySelectorAll('img.stream-thumb').forEach(attachThumbHover);
+  document.querySelectorAll('video.direct-mp4-preview').forEach(attachDirectMp4Preview);
 
   streams.forEach((stream) => {
     if (!stream.downloadState?.progress) return;
@@ -626,6 +631,82 @@ function renderStreams(streams, tabId, pageTitle = currentPageTitle) {
     });
     updateDownloadProgress(stream.url, stream.downloadState.progress);
   });
+}
+
+function attachDirectMp4Preview(video) {
+  const url = video.dataset.url;
+  const hoverTarget = video.closest('.stream-thumb-wrap') || video;
+  let metadataSent = false;
+  let restingTime = 0;
+  let hovering = false;
+  let hoverIndex = 0;
+  let hoverTimer = null;
+  const previewFractions = [0.05, 0.2, 0.35, 0.5, 0.65, 0.8, 0.95];
+
+  const publishMetadata = () => {
+    if (metadataSent || !Number.isFinite(video.duration) || video.duration <= 0) return;
+    metadataSent = true;
+    const resolution = video.videoWidth > 0 && video.videoHeight > 0
+      ? `${video.videoWidth}x${video.videoHeight}`
+      : null;
+
+    chrome.runtime.sendMessage({
+      action: 'cacheDirectMp4Meta',
+      url,
+      meta: {
+        durationSeconds: video.duration,
+        resolution
+      }
+    }).catch(() => {});
+  };
+
+  const seekToPreview = () => {
+    publishMetadata();
+    if (!Number.isFinite(video.duration) || video.duration <= 0) return;
+    restingTime = Math.min(5, Math.max(0.25, video.duration * 0.01));
+    if (Math.abs(video.currentTime - restingTime) > 0.1) {
+      try { video.currentTime = restingTime; } catch { /* metadata is still useful */ }
+    }
+    if (hovering) seekNextHoverFrame();
+  };
+
+  const clearHoverTimer = () => {
+    if (hoverTimer) clearTimeout(hoverTimer);
+    hoverTimer = null;
+  };
+
+  const seekNextHoverFrame = () => {
+    clearHoverTimer();
+    if (!hovering || !Number.isFinite(video.duration) || video.duration <= 0) return;
+    const fraction = previewFractions[hoverIndex % previewFractions.length];
+    hoverIndex++;
+    try { video.currentTime = Math.max(0.25, video.duration * fraction); } catch { /* try the next frame */ }
+  };
+
+  video.addEventListener('seeked', () => {
+    if (!hovering) return;
+    clearHoverTimer();
+    hoverTimer = setTimeout(seekNextHoverFrame, 700);
+  });
+
+  hoverTarget.addEventListener('mouseenter', () => {
+    hovering = true;
+    hoverIndex = 0;
+    seekNextHoverFrame();
+  });
+
+  hoverTarget.addEventListener('mouseleave', () => {
+    hovering = false;
+    clearHoverTimer();
+    video.pause();
+    if (restingTime > 0) {
+      try { video.currentTime = restingTime; } catch { /* leave the last preview frame */ }
+    }
+  });
+
+  video.addEventListener('loadedmetadata', seekToPreview, { once: true });
+  video.addEventListener('durationchange', publishMetadata);
+  if (video.readyState >= HTMLMediaElement.HAVE_METADATA) seekToPreview();
 }
 
 function beginTitleEdit(url) {
@@ -1240,13 +1321,15 @@ function renderSize(meta, format = 'm3u8') {
   const parts = [];
   if (meta.bytes) {
     const tooBig = meta.bytes > MEMORY_LIMIT_BYTES;
+    const estimateMark = meta.estimated === false ? '' : '~';
     parts.push(
-      `<span class="size-value ${tooBig ? 'size-warn' : ''}">📦 ~${formatBytes(meta.bytes)}</span>`
+      `<span class="size-value ${tooBig ? 'size-warn' : ''}">📦 ${estimateMark}${formatBytes(meta.bytes)}</span>`
     );
   }
   if (meta.durationSeconds) parts.push(`<span>🎞️ ${formatDuration(meta.durationSeconds)}</span>`);
   if (meta.resolution) parts.push(`<span>🖥️ ${escapeHtml(meta.resolution)}</span>`);
   if (meta.segments) parts.push(`<span>${meta.segments} segments</span>`);
+  if (meta.direct) parts.push('<span>Single MP4 file</span>');
 
   let html = parts.join('');
   if (meta.bytes && meta.bytes > MEMORY_LIMIT_BYTES) {
