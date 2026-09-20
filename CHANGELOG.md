@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.1](https://github.com/austin-aegirtech/crawlcast-extension/compare/v0.2.0...v0.2.1) (2026-09-20)
+
+
+### Bug Fixes
+
+* **badge:** show badge when PDF is detected ([#23](https://github.com/austin-aegirtech/crawlcast-extension/issues/23)) ([73af544](https://github.com/austin-aegirtech/crawlcast-extension/commit/73af54497466dec928ae3b205b2f12ab7d6f1c17))
+
 ## [0.2.0](https://github.com/austin-aegirtech/crawlcast-extension/compare/v0.1.0...v0.2.0) (2026-09-20)
 
 
