@@ -338,8 +338,7 @@ crawlcast-extension/
 ├── m3u8-parser.js                # HLS playlist parsing
 ├── downloader.js                 # HLS segment fetching and transmux orchestration
 ├── lib/
-│   ├── mux.min.js                # HLS TS → MP4 transmux dependency
-│   └── StreamSaver.min.js        # Checked-in library file
+│   └── mux.min.js                # HLS TS → MP4 transmux dependency
 ├── icons/                        # Extension icons and artwork
 ├── native-host/
 │   ├── crawlcast_host.py         # MP4 inspection + FFmpeg/FFprobe repair host

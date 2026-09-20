@@ -1158,10 +1158,6 @@ function formatCountdown(ms) {
 }
 
 // Utility functions
-function truncateUrl(url, maxLen) {
-  return url.length > maxLen ? url.substring(0, maxLen) + '...' : url;
-}
-
 function escapeHtml(text) {
   const div = document.createElement('div');
   div.textContent = text;
