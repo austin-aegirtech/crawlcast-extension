@@ -7,7 +7,7 @@
 
   Crawlcast is a Manifest V3 browser extension for detecting HLS streams and direct MP4 media, downloading them from the active page, and producing practical local video files with an optional native FFmpeg repair step.
 
-  [![Version](https://img.shields.io/badge/version-0.1.0-0284c7?style=for-the-badge)](./manifest.json)
+  [![Version](https://img.shields.io/badge/version-0.3.0-0284c7?style=for-the-badge)](./manifest.json)
   [![Manifest V3](https://img.shields.io/badge/Chrome-Manifest%20V3-4285F4?style=for-the-badge&logo=googlechrome&logoColor=white)](./manifest.json)
   [![HLS](https://img.shields.io/badge/HLS-M3U8-0ea5e9?style=for-the-badge)](./m3u8-parser.js)
   [![MP4](https://img.shields.io/badge/Direct-MP4-8b5cf6?style=for-the-badge)](./background.js)
