@@ -535,15 +535,34 @@ chrome.webRequest.onBeforeRequest.addListener(
   ["requestBody"]
 );
 
-// Some PDF endpoints do not include .pdf in the URL. Detect a loaded PDF by
-// its response Content-Type so direct documents and embedded viewers still
-// appear even when their URLs are extensionless.
+function getResponseHeader(headers, name) {
+  return (headers || []).find(
+    (header) => (header.name || '').toLowerCase() === name
+  )?.value || '';
+}
+
+function getResponseTotalBytes(details) {
+  const contentRange = getResponseHeader(details.responseHeaders, 'content-range');
+  const rangeMatch = contentRange.match(/\/\s*(\d+)\s*$/);
+  if (rangeMatch) return Number(rangeMatch[1]) || 0;
+
+  // A 206 Content-Length is only the current range, not the complete file.
+  if (details.statusCode === 206) return 0;
+  return Number(getResponseHeader(details.responseHeaders, 'content-length')) || 0;
+}
+
+// Detect extensionless PDF/MP4 responses by Content-Type. For MP4 responses,
+// retain the complete file size from Content-Range/Content-Length so direct
+// files have useful metadata without downloading them first.
 chrome.webRequest.onHeadersReceived.addListener(
   (details) => {
-    const contentType = (details.responseHeaders || []).find(
-      (header) => (header.name || '').toLowerCase() === 'content-type'
-    )?.value || '';
-    if (!/^application\/pdf(?:\s*;|$)/i.test(contentType)) return;
+    const contentType = getResponseHeader(details.responseHeaders, 'content-type');
+    const format = /^application\/pdf(?:\s*;|$)/i.test(contentType)
+      ? 'pdf'
+      : (/^video\/mp4(?:\s*;|$)/i.test(contentType) || getStreamFormat(details.url) === 'mp4'
+        ? 'mp4'
+        : null);
+    if (!format) return;
 
     const changed = addDetectedItem({
       url: details.url,
@@ -551,14 +570,31 @@ chrome.webRequest.onHeadersReceived.addListener(
       tabId: details.tabId,
       type: details.type,
       initiator: details.initiator || 'unknown',
-      format: 'pdf',
+      format,
       title: null
     });
-    if (!changed) return;
+
+    let metaChanged = false;
+    if (format === 'mp4') {
+      const stream = detectedStreams.get(details.url);
+      const bytes = getResponseTotalBytes(details);
+      if (stream && bytes > 0 && stream.meta?.bytes !== bytes) {
+        stream.meta = {
+          ...(stream.meta || {}),
+          bytes,
+          direct: true,
+          estimated: false
+        };
+        metaChanged = true;
+        broadcast({ action: 'streamMeta', url: details.url, meta: stream.meta });
+      }
+    }
+
+    if (!changed && !metaChanged) return;
 
     persistStreams();
-    updateBadge(details.tabId);
-    console.log('[PDF Detector] Found by Content-Type:', details.url);
+    if (changed) updateBadge(details.tabId);
+    console.log(`[${format.toUpperCase()} Detector] Found by response headers:`, details.url);
   },
   { urls: ["<all_urls>"] },
   ["responseHeaders"]
@@ -718,6 +754,37 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           };
         });
       updateBadge(request.tabId).finally(() => sendResponse({ streams }));
+    });
+    return true;
+  }
+
+  // A direct MP4 preview element can read duration and dimensions without
+  // downloading the whole file. Cache those values beside header-derived size.
+  if (request.action === 'cacheDirectMp4Meta') {
+    streamsRestored.then(() => {
+      const stream = detectedStreams.get(request.url);
+      if (!stream || getStreamFormat(stream) !== 'mp4') {
+        sendResponse({ success: false });
+        return;
+      }
+
+      const incoming = request.meta || {};
+      const meta = {
+        ...(stream.meta || {}),
+        direct: true,
+        estimated: false
+      };
+      if (Number.isFinite(incoming.durationSeconds) && incoming.durationSeconds > 0) {
+        meta.durationSeconds = incoming.durationSeconds;
+      }
+      if (typeof incoming.resolution === 'string' && /^\d+x\d+$/.test(incoming.resolution)) {
+        meta.resolution = incoming.resolution;
+      }
+
+      stream.meta = meta;
+      persistStreams();
+      broadcast({ action: 'streamMeta', url: request.url, meta });
+      sendResponse({ success: true, meta });
     });
     return true;
   }
@@ -931,7 +998,8 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         if (getStreamFormat(s) !== 'm3u8') return false;
         // The same job produces both the preview and the size metadata,
         // so run it if either is still missing and hasn't already failed
-        return (!s.thumbnail && !s.thumbnailTried) || (!s.meta && !s.metaTried);
+        const thumbnailAttempts = Number(s.thumbnailAttempts) || 0;
+        return (!s.thumbnail && thumbnailAttempts < 3) || (!s.meta && !s.metaTried);
       });
       if (targets.length === 0) {
         sendResponse({ started: 0 });
@@ -964,9 +1032,15 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     streamsRestored.then(() => {
       const stream = detectedStreams.get(request.url);
       if (stream) {
-        stream.thumbnailTried = true; // don't retry failures on every popup open
+        if (request.thumbnail) {
+          stream.thumbnail = request.thumbnail;
+          stream.thumbnailTried = true;
+          stream.thumbnailAttempts = 0;
+        } else {
+          stream.thumbnailAttempts = (Number(stream.thumbnailAttempts) || 0) + 1;
+          stream.thumbnailTried = stream.thumbnailAttempts >= 3;
+        }
         stream.metaTried = true;
-        if (request.thumbnail) stream.thumbnail = request.thumbnail;
         if (request.frames) stream.frames = request.frames; // hover animation frames
         persistStreams();
       }
