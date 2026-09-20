@@ -352,6 +352,10 @@ function renderStreams(streams, tabId, pageTitle = currentPageTitle) {
   listEl.innerHTML = streams.map((stream) => {
     const isComplete = completedDownloadsUI.has(stream.url);
     const isDownloading = !isComplete && (activeDownloadsUI.has(stream.url) || stream.downloading);
+    const activeState = activeDownloadsUI.get(stream.url) || stream.downloadState;
+    const isPaused = isDownloading && (
+      activeState?.paused === true || activeState?.progress?.phase === 'paused'
+    );
     const isRateLimited = isUserModeRateLimited();
     const hash = hashCode(stream.url);
     const displayTitle = getStreamTitle(stream, pageTitle);
@@ -425,19 +429,32 @@ function renderStreams(streams, tabId, pageTitle = currentPageTitle) {
 
             <div class="card-actions">
               ${isDownloading ? `<button class="cancel-btn" id="cancel-${hash}" data-url="${escapeHtml(stream.url)}" type="button">Cancel</button>` : ''}
-              <button
-                class="download-btn"
-                id="download-${hash}"
-                data-url="${escapeHtml(stream.url)}"
-                data-tab="${tabId}"
-                data-format="${streamFormat}"
-                data-state="${isComplete ? 'complete' : (isDownloading ? 'downloading' : 'idle')}"
-                type="button"
-                ${isDownloading || isComplete || isRateLimited ? 'disabled' : ''}
-              >
-                <span class="download-icon">${isComplete ? '✓' : '↓'}</span>
-                <span>${isComplete ? 'Complete!' : (isDownloading ? 'Downloading…' : 'Download')}</span>
-              </button>
+              <div class="download-controls">
+                <button
+                  class="download-btn"
+                  id="download-${hash}"
+                  data-url="${escapeHtml(stream.url)}"
+                  data-tab="${tabId}"
+                  data-format="${streamFormat}"
+                  data-state="${isComplete ? 'complete' : (isDownloading ? 'downloading' : 'idle')}"
+                  type="button"
+                  ${isDownloading || isComplete || isRateLimited ? 'disabled' : ''}
+                >
+                  <span class="download-icon">${isComplete ? '✓' : '↓'}</span>
+                  <span>${isComplete ? 'Complete!' : (isPaused ? 'Paused' : (isDownloading ? 'Downloading…' : 'Download'))}</span>
+                </button>
+                ${isDownloading ? `
+                  <button
+                    class="pause-btn"
+                    id="pause-${hash}"
+                    data-url="${escapeHtml(stream.url)}"
+                    data-paused="${isPaused}"
+                    type="button"
+                    aria-label="${isPaused ? 'Resume download' : 'Pause download'}"
+                    title="${isPaused ? 'Resume download' : 'Pause download'}"
+                  >${renderPauseControlIcon(isPaused)}</button>
+                ` : ''}
+              </div>
             </div>
           </div>
         </div>
@@ -445,7 +462,7 @@ function renderStreams(streams, tabId, pageTitle = currentPageTitle) {
         <div class="progress-container ${isDownloading || isComplete ? 'active' : ''}" id="progress-${hash}">
           <progress class="progress-bar" max="100" value="${isComplete ? '100' : '0'}" aria-label="Download progress"></progress>
           <div class="progress-text">
-            <span class="progress-status">${isComplete ? 'Complete' : 'Initializing...'}</span>
+            <span class="progress-status">${isComplete ? 'Complete' : (isPaused ? 'Paused' : 'Initializing...')}</span>
             <span class="progress-percent">${isComplete ? '100%' : '0%'}</span>
           </div>
         </div>
@@ -467,6 +484,13 @@ function renderStreams(streams, tabId, pageTitle = currentPageTitle) {
     btn.addEventListener('click', () => cancelDownload(btn.dataset.url));
   });
 
+  document.querySelectorAll('.pause-btn').forEach(btn => {
+    btn.addEventListener('click', () => toggleDownloadPause(
+      btn.dataset.url,
+      btn.dataset.paused === 'true'
+    ));
+  });
+
   document.querySelectorAll('.stream-title:not(.title-locked)').forEach(titleEl => {
     titleEl.addEventListener('click', (event) => {
       if (event.target.closest('.title-edit-btn')) return;
@@ -482,6 +506,15 @@ function renderStreams(streams, tabId, pageTitle = currentPageTitle) {
   });
 
   document.querySelectorAll('img.stream-thumb').forEach(attachThumbHover);
+
+  streams.forEach((stream) => {
+    if (!stream.downloadState?.progress) return;
+    activeDownloadsUI.set(stream.url, {
+      paused: !!stream.downloadState.paused,
+      progress: stream.downloadState.progress
+    });
+    updateDownloadProgress(stream.url, stream.downloadState.progress);
+  });
 }
 
 function beginTitleEdit(url) {
@@ -670,6 +703,11 @@ function updateDownloadProgress(url, progress) {
   const progressBar = container?.querySelector('.progress-bar');
   const status = container?.querySelector('.progress-status');
   const percent = container?.querySelector('.progress-percent');
+  const paused = progress?.paused === true || progress?.phase === 'paused';
+  const previousState = activeDownloadsUI.get(url) || {};
+
+  activeDownloadsUI.set(url, { ...previousState, paused, progress });
+  updatePauseButton(url, paused, progress?.phase);
 
   if (container && progressBar) {
     container.classList.add('active');
@@ -681,12 +719,15 @@ function updateDownloadProgress(url, progress) {
       if (total > 0) {
         progressBar.value = progress.percent;
         if (percent) percent.textContent = `${progress.percent}%`;
-        if (status) status.textContent = `Downloading: ${formatBytes(received)} / ${formatBytes(total)}`;
+        if (status) {
+          status.textContent = `${paused ? 'Paused' : 'Downloading'}: ${formatBytes(received)} / ${formatBytes(total)}`;
+        }
       } else {
         // Native <progress> becomes indeterminate without a value attribute.
-        progressBar.removeAttribute('value');
+        if (paused) progressBar.value = progress.percent || 0;
+        else progressBar.removeAttribute('value');
         if (percent) percent.textContent = '';
-        if (status) status.textContent = `Downloading: ${formatBytes(received)}`;
+        if (status) status.textContent = `${paused ? 'Paused' : 'Downloading'}: ${formatBytes(received)}`;
       }
       return;
     }
@@ -694,7 +735,11 @@ function updateDownloadProgress(url, progress) {
     progressBar.value = progress.percent;
 
     if (status) {
-      if (progress.phase === 'finalizing') {
+      if (paused) {
+        const failed = progress.failed > 0 ? `, ${progress.failed} failed` : '';
+        status.textContent =
+          `Paused: ${progress.downloaded}/${progress.total} segments (${progress.mbDownloaded} MB${failed})`;
+      } else if (progress.phase === 'finalizing') {
         // Assembling a multi-GB Blob can take a while — say so rather than
         // sitting at 100% looking frozen
         status.textContent = `Finalizing ${progress.mbDownloaded} MB — this can take a moment…`;
@@ -706,6 +751,57 @@ function updateDownloadProgress(url, progress) {
     }
     if (percent) percent.textContent = `${progress.percent}%`;
   }
+}
+
+function updatePauseButton(url, paused, phase) {
+  const hash = hashCode(url);
+  const button = document.getElementById(`pause-${hash}`);
+  const downloadButton = document.getElementById(`download-${hash}`);
+
+  if (button) {
+    button.hidden = phase === 'finalizing';
+    button.dataset.paused = String(paused);
+    button.innerHTML = renderPauseControlIcon(paused);
+    const actionLabel = paused ? 'Resume download' : 'Pause download';
+    button.setAttribute('aria-label', actionLabel);
+    button.title = actionLabel;
+    button.disabled = false;
+  }
+
+  if (downloadButton?.dataset.state === 'downloading') {
+    downloadButton.innerHTML = paused
+      ? '<span class="download-icon">↓</span><span>Paused</span>'
+      : '<span class="download-icon">↓</span><span>Downloading…</span>';
+  }
+}
+
+function renderPauseControlIcon(paused) {
+  return paused
+    ? '<svg class="pause-control-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>'
+    : '<svg class="pause-control-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M6.5 5h4v14h-4zM13.5 5h4v14h-4z"/></svg>';
+}
+
+async function toggleDownloadPause(url, currentlyPaused) {
+  const button = document.getElementById(`pause-${hashCode(url)}`);
+  if (button) button.disabled = true;
+
+  const response = await chrome.runtime.sendMessage({
+    action: 'setDownloadPaused',
+    url,
+    paused: !currentlyPaused
+  }).catch((error) => ({ success: false, error: error?.message || String(error) }));
+
+  if (!response?.success) {
+    if (button) button.disabled = false;
+    setStatus(url, 'status-error', `❌ ${response?.error || 'Could not change download state'}`);
+    return;
+  }
+
+  updateDownloadProgress(url, response.progress || {
+    ...(activeDownloadsUI.get(url)?.progress || {}),
+    phase: response.paused ? 'paused' : 'downloading',
+    paused: response.paused
+  });
 }
 
 function cancelDownload(url) {
@@ -766,6 +862,8 @@ function markDownloadComplete(url) {
   const hash = hashCode(url);
   const cancel = document.getElementById(`cancel-${hash}`);
   if (cancel) cancel.remove();
+  const pause = document.getElementById(`pause-${hash}`);
+  if (pause) pause.remove();
 
   const btn = document.getElementById(`download-${hash}`);
   if (btn) {
@@ -783,6 +881,8 @@ function markRepairSkipped(url) {
   const hash = hashCode(url);
   const cancel = document.getElementById(`cancel-${hash}`);
   if (cancel) cancel.remove();
+  const pause = document.getElementById(`pause-${hash}`);
+  if (pause) pause.remove();
 
   const btn = document.getElementById(`download-${hash}`);
   if (btn) {

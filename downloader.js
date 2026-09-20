@@ -13,6 +13,9 @@ class VideoDownloader {
     
     this.parser = new M3U8Parser();
     this.abortController = new AbortController();
+    this.paused = false;
+    this.pauseWaiters = [];
+    this.currentPhase = 'downloading';
     this.stats = {
       totalSegments: 0,
       downloaded: 0,
@@ -123,6 +126,10 @@ class VideoDownloader {
 
       // Step 5: Download and process segments
       await this.downloadSegments(mediaPlaylist.segments, transmuxer, writer, mediaPlaylist.initSegmentUrl);
+      if (this.abortController.signal.aborted) return;
+
+      await this.waitWhilePaused();
+      if (this.abortController.signal.aborted) return;
 
       // Step 6: Finalize — assembling a multi-GB Blob takes real time,
       // so tell the UI rather than sitting at 100% looking frozen
@@ -144,6 +151,8 @@ class VideoDownloader {
       let audioBlob = null;
       if (audioRendition) {
         try {
+          await this.waitWhilePaused();
+          if (this.abortController.signal.aborted) return;
           audioBlob = await this.downloadAudioTrack(audioRendition);
         } catch (e) {
           console.error('[Downloader] Audio track failed:', e);
@@ -174,6 +183,7 @@ class VideoDownloader {
    * Fetch and parse m3u8 playlist
    */
   async fetchPlaylist(url) {
+    await this.waitWhilePaused();
     const response = await fetch(url, {
       signal: this.abortController.signal
     });
@@ -238,6 +248,7 @@ class VideoDownloader {
     const pending = new Map(); // index -> Promise<ArrayBuffer|null>
 
     for (let i = 0; i < segments.length; i++) {
+      await this.waitWhilePaused();
       if (this.abortController.signal.aborted) break;
 
       // Keep the fetch window full
@@ -286,6 +297,7 @@ class VideoDownloader {
 
   /** Fetch an EXT-X-MAP init segment (the moov box fMP4 fragments depend on). */
   async fetchInitSegment(url) {
+    await this.waitWhilePaused();
     const response = await fetch(url, { signal: this.abortController.signal });
     if (!response.ok) throw new Error(`HTTP ${response.status} fetching init segment`);
     return new Uint8Array(await response.arrayBuffer());
@@ -308,6 +320,7 @@ class VideoDownloader {
    * @returns {Promise<Blob>} audio-only MP4
    */
   async downloadAudioTrack(rendition) {
+    this.currentPhase = 'audio';
     console.log('[Downloader] Fetching audio playlist:', rendition.url);
     const audioPlaylist = await this.fetchPlaylist(rendition.url);
 
@@ -333,6 +346,7 @@ class VideoDownloader {
     let done = 0;
 
     for (let i = 0; i < audioPlaylist.segments.length; i++) {
+      await this.waitWhilePaused();
       if (this.abortController.signal.aborted) break;
 
       const buf = await this.fetchSegmentWithRetry(audioPlaylist.segments[i], i);
@@ -433,6 +447,7 @@ class VideoDownloader {
   /** Wait until the current shared cooldown expires (or the user cancels). */
   async waitForRetryPause() {
     while (!this.abortController.signal.aborted) {
+      await this.waitWhilePaused();
       const remaining = this.retryPauseUntil - Date.now();
       if (remaining <= 0) return;
       await this.delay(remaining);
@@ -449,6 +464,7 @@ class VideoDownloader {
     const segmentNumber = index + 1;
 
     for (let attempt = 1; attempt <= this.maxSegmentAttempts; attempt++) {
+      await this.waitWhilePaused();
       await this.waitForRetryPause();
       if (this.abortController.signal.aborted) return null;
 
@@ -632,18 +648,22 @@ class VideoDownloader {
   /**
    * Report download progress
    */
-  reportProgress(phase = 'downloading') {
+  reportProgress(phase = this.currentPhase) {
+    if (phase !== 'paused') this.currentPhase = phase;
     const processed = this.stats.downloaded + this.stats.failed;
     // Floor, and never show 100% until every segment is accounted for —
     // Math.round made 4127/4130 display as "100%" for the last 20 segments
-    let percent = Math.floor((processed / this.stats.totalSegments) * 100);
+    let percent = this.stats.totalSegments > 0
+      ? Math.floor((processed / this.stats.totalSegments) * 100)
+      : 0;
     if (percent >= 100 && processed < this.stats.totalSegments) percent = 99;
 
     const mbDownloaded = (this.stats.bytesDownloaded / 1024 / 1024).toFixed(2);
 
     this.onProgress({
       percent,
-      phase,
+      phase: this.paused ? 'paused' : phase,
+      paused: this.paused,
       downloaded: this.stats.downloaded,
       total: this.stats.totalSegments,
       failed: this.stats.failed,
@@ -672,10 +692,41 @@ class VideoDownloader {
     });
   }
 
+  /** Pause after any segment requests already in flight have settled. */
+  pause() {
+    if (this.paused || this.abortController.signal.aborted || this.currentPhase === 'finalizing') {
+      return false;
+    }
+
+    this.paused = true;
+    this.reportProgress('paused');
+    return true;
+  }
+
+  /** Resume segment scheduling and release every paused worker. */
+  resume() {
+    if (!this.paused || this.abortController.signal.aborted) return false;
+
+    this.paused = false;
+    const waiters = this.pauseWaiters.splice(0);
+    waiters.forEach((resolve) => resolve());
+    this.reportProgress(this.currentPhase);
+    return true;
+  }
+
+  async waitWhilePaused() {
+    while (this.paused && !this.abortController.signal.aborted) {
+      await new Promise((resolve) => this.pauseWaiters.push(resolve));
+    }
+  }
+
   /**
    * Cancel download
    */
   cancel() {
+    this.paused = false;
+    const waiters = this.pauseWaiters.splice(0);
+    waiters.forEach((resolve) => resolve());
     this.abortController.abort();
   }
 }

@@ -647,8 +647,15 @@ img.stream-thumb {
   margin-top: auto;
   padding-top: 10px;
   display: flex;
+  align-items: center;
   justify-content: flex-end;
   gap: 8px;
+}
+
+.download-controls {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
 }
 
 .download-btn,
@@ -692,6 +699,47 @@ img.stream-thumb {
   background: #433033;
   color: #ffaaa5;
   border: 1px solid #694347;
+}
+
+.pause-btn {
+  width: 38px;
+  min-width: 38px;
+  height: 38px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 38px;
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  background: var(--surface-3);
+  color: var(--text);
+  transition: transform 0.18s ease, background 0.18s ease, border-color 0.18s ease, color 0.18s ease;
+}
+
+.pause-btn:hover:not(:disabled) {
+  background: var(--brand-soft);
+  border-color: var(--brand-border);
+  color: var(--accent-hover);
+  transform: translateY(-1px);
+}
+
+.pause-btn[data-paused="true"] {
+  background: var(--brand-soft);
+  border-color: var(--brand-border);
+  color: var(--accent-hover);
+}
+
+.pause-btn:disabled {
+  cursor: wait;
+  opacity: 0.65;
+}
+
+.pause-control-icon {
+  width: 17px;
+  height: 17px;
+  display: block;
+  fill: currentColor;
 }
 
 .cancel-btn:hover {

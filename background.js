@@ -27,9 +27,11 @@ const directDownloadsRestored = chrome.storage.session.get('directDownloads').th
     directDownloads.set(numericId, entry);
     activeDownloads.set(entry.streamUrl, {
       kind: 'direct',
+      paused: !!entry.paused,
       progress: {
         kind: 'direct',
-        phase: 'downloading',
+        phase: entry.paused ? 'paused' : 'downloading',
+        paused: !!entry.paused,
         percent: entry.totalBytes > 0
           ? Math.min(99, Math.round(((entry.bytesReceived || 0) / entry.totalBytes) * 100))
           : 0,
@@ -51,12 +53,54 @@ const directDownloadsRestored = chrome.storage.session.get('directDownloads').th
 
     entry.bytesReceived = item.bytesReceived || entry.bytesReceived || 0;
     entry.totalBytes = item.totalBytes || entry.totalBytes || 0;
+    entry.paused = !!item.paused;
+
+    const restoredActive = activeDownloads.get(entry.streamUrl);
+    if (restoredActive) {
+      restoredActive.paused = entry.paused;
+      restoredActive.progress.paused = entry.paused;
+      restoredActive.progress.phase = entry.paused ? 'paused' : 'downloading';
+    }
 
     if (item.state === 'complete') {
       completeDirectDownload(numericId, entry);
     }
   }
   persistDirectDownloads();
+});
+
+let hlsDownloadsPersistTimer = null;
+
+function getActiveHlsDownloadEntries() {
+  return Array.from(activeDownloads.entries())
+    .filter(([, info]) => info?.kind === 'hls');
+}
+
+function persistActiveHlsDownloadsNow() {
+  if (hlsDownloadsPersistTimer) {
+    clearTimeout(hlsDownloadsPersistTimer);
+    hlsDownloadsPersistTimer = null;
+  }
+  return chrome.storage.session.set({
+    activeHlsDownloads: getActiveHlsDownloadEntries()
+  });
+}
+
+function scheduleActiveHlsDownloadsPersist() {
+  if (hlsDownloadsPersistTimer) return;
+  hlsDownloadsPersistTimer = setTimeout(() => {
+    hlsDownloadsPersistTimer = null;
+    chrome.storage.session.set({
+      activeHlsDownloads: getActiveHlsDownloadEntries()
+    });
+  }, 500);
+}
+
+const hlsDownloadsRestored = chrome.storage.session.get('activeHlsDownloads').then((data) => {
+  for (const [url, info] of (data.activeHlsDownloads || [])) {
+    if (!url || info?.kind !== 'hls' || activeDownloads.has(url)) continue;
+    activeDownloads.set(url, info);
+  }
 });
 
 // Free-tier mode state. User Mode allows one accepted download start per
@@ -126,14 +170,19 @@ function handleDirectDownloadDelta(delta, entry) {
   if (delta.totalBytes && Number.isFinite(delta.totalBytes.current)) {
     entry.totalBytes = delta.totalBytes.current;
   }
+  if (delta.paused && typeof delta.paused.current === 'boolean') {
+    entry.paused = delta.paused.current;
+  }
   persistDirectDownloads();
 
   const active = activeDownloads.get(entry.streamUrl);
   if (active) {
     active.lastProgressAt = Date.now();
+    active.paused = !!entry.paused;
     active.progress = {
       kind: 'direct',
-      phase: 'downloading',
+      phase: entry.paused ? 'paused' : 'downloading',
+      paused: !!entry.paused,
       bytesReceived: entry.bytesReceived || 0,
       totalBytes: entry.totalBytes || 0,
       mbDownloaded: ((entry.bytesReceived || 0) / 1e6).toFixed(1),
@@ -159,6 +208,22 @@ function handleDirectDownloadDelta(delta, entry) {
     });
     maybeCloseOffscreen();
   }
+}
+
+function setActiveDownloadPaused(active, paused) {
+  if (paused && active.progress?.phase !== 'paused') {
+    active.resumePhase = active.progress?.phase || 'downloading';
+  }
+
+  active.paused = paused;
+  active.lastProgressAt = Date.now();
+  active.progress = {
+    ...(active.progress || {}),
+    paused,
+    phase: paused ? 'paused' : (active.resumePhase || 'downloading')
+  };
+
+  return active.progress;
 }
 
 function completeDirectDownload(downloadId, entry) {
@@ -575,13 +640,22 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
   // Get streams for popup
   if (request.action === 'getStreams') {
-    Promise.all([streamsRestored, directDownloadsRestored]).then(() => {
+    Promise.all([streamsRestored, directDownloadsRestored, hlsDownloadsRestored]).then(() => {
       const streams = Array.from(detectedStreams.values())
         .filter(s => s.tabId === request.tabId)
         .sort((a, b) => b.timestamp - a.timestamp)
         // Attach live download state — the popup loses its own copy
         // whenever it closes, so it must come from here
-        .map(s => ({ ...s, downloading: activeDownloads.has(s.url) }));
+        .map((s) => {
+          const active = activeDownloads.get(s.url);
+          return {
+            ...s,
+            downloading: !!active,
+            downloadState: active
+              ? { paused: !!active.paused, progress: active.progress || null }
+              : null
+          };
+        });
       sendResponse({ streams });
     });
   }
@@ -617,6 +691,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         // so let Clear release it rather than locking the card forever.
         const info = activeDownloads.get(url);
         if (info) {
+          if (info.paused) continue;
           const lastActivity = info.lastProgressAt || info.startTime;
           if (Date.now() - lastActivity < STALE_DOWNLOAD_MS) continue;
           activeDownloads.delete(url);
@@ -625,6 +700,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         detectedStreams.delete(url);
       }
       persistStreams();
+      persistActiveHlsDownloadsNow();
       maybeCloseOffscreen();
 
       // Badge reflects what's left (may be non-zero if downloads were kept)
@@ -719,6 +795,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       filename: request.filename
     }).then(async (downloadId) => {
       activeDownloads.delete(request.streamUrl);
+      persistActiveHlsDownloadsNow();
       pendingBlobUrls.set(downloadId, {
         blobUrl: request.blobUrl,
         streamUrl: request.streamUrl
@@ -745,6 +822,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       }
     }).catch((err) => {
       activeDownloads.delete(request.streamUrl);
+      persistActiveHlsDownloadsNow();
       chrome.runtime.sendMessage({
         action: 'downloadError',
         url: request.streamUrl,
@@ -765,13 +843,17 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     if (info) {
       info.lastProgressAt = Date.now();
       info.progress = request.progress;
+      info.paused = request.progress?.paused === true || request.progress?.phase === 'paused';
+      if (info.kind === 'hls') scheduleActiveHlsDownloadsPersist();
     }
   }
 
   // Offscreen pipeline failed before producing a blob — drop tracking
   // (the popup receives the same broadcast directly)
   if (request.action === 'downloadError') {
+    const failed = activeDownloads.get(request.url);
     activeDownloads.delete(request.url);
+    if (failed?.kind === 'hls') persistActiveHlsDownloadsNow();
     maybeCloseOffscreen();
   }
 
@@ -829,6 +911,74 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     });
   }
 
+  // Pause or resume an active download. Browser-managed MP4/PDF downloads
+  // use chrome.downloads; HLS pauses segment scheduling in the offscreen
+  // VideoDownloader after any requests already in flight have settled.
+  if (request.action === 'setDownloadPaused') {
+    const active = activeDownloads.get(request.url);
+    const paused = request.paused === true;
+
+    if (!active) {
+      sendResponse({ success: false, error: 'Download is not active' });
+      return false;
+    }
+
+    if (active.progress?.phase === 'finalizing') {
+      sendResponse({ success: false, error: 'Download is already finalizing' });
+      return false;
+    }
+
+    if (!!active.paused === paused) {
+      sendResponse({ success: true, paused, progress: active.progress });
+      return false;
+    }
+
+    if (active.kind === 'direct') {
+      directDownloadsRestored.then(async () => {
+        const current = activeDownloads.get(request.url);
+        if (!current || !Number.isInteger(current.downloadId)) {
+          sendResponse({ success: false, error: 'Download is still initializing' });
+          return;
+        }
+
+        try {
+          if (paused) {
+            await chrome.downloads.pause(current.downloadId);
+          } else {
+            await chrome.downloads.resume(current.downloadId);
+          }
+
+          const entry = directDownloads.get(current.downloadId);
+          if (entry) {
+            entry.paused = paused;
+            persistDirectDownloads();
+          }
+
+          const progress = setActiveDownloadPaused(current, paused);
+          broadcast({ action: 'downloadProgress', url: request.url, progress });
+          sendResponse({ success: true, paused, progress });
+        } catch (error) {
+          sendResponse({
+            success: false,
+            error: error?.message || `Could not ${paused ? 'pause' : 'resume'} download`
+          });
+        }
+      });
+      return true;
+    }
+
+    const progress = setActiveDownloadPaused(active, paused);
+    persistActiveHlsDownloadsNow();
+    chrome.runtime.sendMessage({
+      target: 'offscreen',
+      action: paused ? 'pauseDownload' : 'resumeDownload',
+      url: request.url
+    }).catch(() => {});
+    broadcast({ action: 'downloadProgress', url: request.url, progress });
+    sendResponse({ success: true, paused, progress });
+    return false;
+  }
+
   // Cancel download
   // Cancel a download. The VideoDownloader lives in the offscreen document,
   // so forward the request there; also release our own tracking immediately
@@ -836,6 +986,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.action === 'cancelDownload') {
     const active = activeDownloads.get(request.url);
     activeDownloads.delete(request.url);
+    if (active?.kind === 'hls') persistActiveHlsDownloadsNow();
 
     if (active?.kind === 'direct' && Number.isInteger(active.downloadId)) {
       directDownloads.delete(active.downloadId);
@@ -880,6 +1031,7 @@ function broadcast(message) {
  * handed to the browser downloads API. Only MP4 is inspected/remuxed.
  */
 async function startDownload(url, filename, tabId) {
+  await Promise.all([directDownloadsRestored, hlsDownloadsRestored]);
   const stream = detectedStreams.get(url);
   const format = getStreamFormat(stream || url);
 
@@ -894,9 +1046,12 @@ async function startDownload(url, filename, tabId) {
   // the document out from under a download that's about to start
   activeDownloads.set(url, {
     kind: 'hls',
-    progress: { percent: 0, downloaded: 0, total: 0 },
-    startTime: Date.now()
+    paused: false,
+    progress: { percent: 0, downloaded: 0, total: 0, phase: 'downloading', paused: false },
+    startTime: Date.now(),
+    lastProgressAt: Date.now()
   });
+  await persistActiveHlsDownloadsNow();
 
   await ensureOffscreenDocument();
   chrome.runtime.sendMessage({
@@ -910,9 +1065,11 @@ async function startDownload(url, filename, tabId) {
 async function startDirectDownload(url, filename, format) {
   activeDownloads.set(url, {
     kind: 'direct',
+    paused: false,
     progress: {
       kind: 'direct',
       phase: 'downloading',
+      paused: false,
       percent: 0,
       bytesReceived: 0,
       totalBytes: 0,
@@ -931,7 +1088,8 @@ async function startDirectDownload(url, filename, format) {
       format,
       bytesReceived: 0,
       totalBytes: 0,
-      startTime: Date.now()
+      startTime: Date.now(),
+      paused: false
     };
     directDownloads.set(downloadId, entry);
     persistDirectDownloads();
@@ -945,6 +1103,7 @@ async function startDirectDownload(url, filename, format) {
     if (item) {
       entry.bytesReceived = item.bytesReceived || 0;
       entry.totalBytes = item.totalBytes || 0;
+      entry.paused = !!item.paused;
 
       if (item.state === 'complete') {
         completeDirectDownload(downloadId, entry);
@@ -957,7 +1116,8 @@ async function startDirectDownload(url, filename, format) {
         handleDirectDownloadDelta({
           id: downloadId,
           bytesReceived: { current: entry.bytesReceived },
-          totalBytes: { current: entry.totalBytes }
+          totalBytes: { current: entry.totalBytes },
+          paused: { current: entry.paused }
         }, entry);
       }
     }
