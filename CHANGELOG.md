@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.2.0](https://github.com/austin-aegirtech/crawlcast-extension/compare/v0.1.0...v0.2.0) (2026-09-20)
+
+
+### Features
+
+* **pause:** you can now pause downloads ([#20](https://github.com/austin-aegirtech/crawlcast-extension/issues/20)) ([4827111](https://github.com/austin-aegirtech/crawlcast-extension/commit/48271112964159bc282090af3fa8bf1dfdd07359))
+
+
+### Bug Fixes
+
+* **premium:** the premium upsell should not show in God mode ([#17](https://github.com/austin-aegirtech/crawlcast-extension/issues/17)) ([27f5204](https://github.com/austin-aegirtech/crawlcast-extension/commit/27f52043a25e6d62488a5f1dfdc4834a0589559a))
+
+
+### Documentation
+
+* **docs:** adding release logs and daily logs ([35f3cc8](https://github.com/austin-aegirtech/crawlcast-extension/commit/35f3cc8f29009dd9b51ef03d15fb64c108ee288d))
+* **docs:** forgot to include a file ([d07cc7d](https://github.com/austin-aegirtech/crawlcast-extension/commit/d07cc7da752e39e73a3cd53c9ac57c50b380f2d7))
+
 ## 0.1.0 (2026-09-18)
 
 
