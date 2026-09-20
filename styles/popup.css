@@ -711,6 +711,52 @@ video.direct-mp4-preview {
   gap: 6px;
 }
 
+.audio-download-controls {
+  display: inline-flex;
+  align-items: center;
+  overflow: hidden;
+  border: 1px solid var(--brand-border);
+  border-radius: 999px;
+  background: var(--brand-soft);
+}
+
+.audio-format-select {
+  height: 36px;
+  padding: 0 7px 0 10px;
+  border: 0;
+  border-right: 1px solid var(--brand-border);
+  outline: none;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 11px;
+}
+
+.audio-format-select option {
+  background: var(--surface-2);
+  color: var(--text);
+}
+
+.audio-download-btn {
+  min-height: 36px;
+  padding: 7px 12px;
+  border: 0;
+  background: transparent;
+  color: var(--accent-hover);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.audio-download-btn:hover:not(:disabled) {
+  background: rgba(13, 159, 220, 0.14);
+}
+
+.audio-download-btn:disabled,
+.audio-format-select:disabled {
+  cursor: not-allowed;
+  opacity: 0.58;
+}
+
 .download-btn,
 .cancel-btn {
   min-height: 38px;

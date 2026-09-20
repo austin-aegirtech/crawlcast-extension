@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Crawlcast native messaging host for MP4 inspection and remux/repair.
+"""Crawlcast native messaging host for MP4 repair and audio extraction.
 
 Protocol: Chrome native messaging over stdin/stdout using length-prefixed JSON.
 """
@@ -224,6 +224,120 @@ def run_remux(path, audio_path=None):
         })
 
 
+def unique_output_path(directory, filename):
+    """Return a non-existing output path without overwriting prior downloads."""
+    candidate = os.path.join(directory, filename)
+    if not os.path.exists(candidate):
+        return candidate
+
+    stem, ext = os.path.splitext(filename)
+    counter = 1
+    while True:
+        candidate = os.path.join(directory, f"{stem} ({counter}){ext}")
+        if not os.path.exists(candidate):
+            return candidate
+        counter += 1
+
+
+def run_extract_audio(path, output_name, audio_format):
+    """Extract the first audio track to M4A/AAC or 320 kbps MP3.
+
+    M4A first attempts a lossless AAC stream copy. If the source audio codec
+    cannot be stored in M4A, it falls back to AAC transcoding. MP3 always
+    transcodes because MP4/HLS sources normally carry AAC audio.
+    """
+    if not path or not isinstance(path, str):
+        send_message({"type": "error", "message": "A source file path is required"})
+        return
+    if not os.path.isfile(path):
+        send_message({"type": "error", "message": f"Source file not found: {path}"})
+        return
+    if audio_format not in ("m4a", "mp3"):
+        send_message({"type": "error", "message": "Audio format must be m4a or mp3"})
+        return
+
+    requested_name = os.path.basename(str(output_name or "").strip())
+    expected_ext = f".{audio_format}"
+    if not requested_name or requested_name in (".", ".."):
+        requested_name = f"audio{expected_ext}"
+    if not requested_name.lower().endswith(expected_ext):
+        requested_name = os.path.splitext(requested_name)[0] + expected_ext
+
+    output_path = unique_output_path(os.path.dirname(path), requested_name)
+    output_stem, output_ext = os.path.splitext(output_path)
+    tmp = f"{output_stem}.crawlcast.tmp{output_ext}"
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+
+    if audio_format == "m4a":
+        commands = [
+            ([FFMPEG_BIN, "-nostdin", "-v", "error", "-y", "-i", path,
+              "-map", "0:a:0", "-vn", "-c:a", "copy", "-movflags", "+faststart", tmp], False),
+            ([FFMPEG_BIN, "-nostdin", "-v", "error", "-y", "-i", path,
+              "-map", "0:a:0", "-vn", "-c:a", "aac", "-b:a", "256k",
+              "-movflags", "+faststart", tmp], True),
+        ]
+    else:
+        commands = [
+            ([FFMPEG_BIN, "-nostdin", "-v", "error", "-y", "-i", path,
+              "-map", "0:a:0", "-vn", "-c:a", "libmp3lame", "-b:a", "320k",
+              "-id3v2_version", "3", tmp], True),
+        ]
+
+    last_output = ""
+    transcoded = False
+    for cmd, command_transcoded in commands:
+        if os.path.isfile(tmp):
+            os.remove(tmp)
+        try:
+            proc = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                universal_newlines=True,
+                creationflags=creationflags,
+            )
+        except FileNotFoundError:
+            send_message({"type": "error", "message": f"'{FFMPEG_BIN}' not found on PATH"})
+            return
+        except Exception as exc:  # noqa: BLE001
+            send_message({"type": "error", "message": f"Failed to start ffmpeg: {exc}"})
+            return
+
+        last_output = proc.stdout or ""
+        if proc.returncode == 0 and os.path.isfile(tmp) and os.path.getsize(tmp) > 1024:
+            transcoded = command_transcoded
+            break
+    else:
+        if os.path.isfile(tmp):
+            os.remove(tmp)
+        tail = last_output.strip().splitlines()[-2:]
+        send_message({
+            "type": "error",
+            "message": "ffmpeg could not extract audio: " + " | ".join(tail),
+        })
+        return
+
+    try:
+        os.replace(tmp, output_path)
+        source_removed = True
+        try:
+            os.remove(path)
+        except OSError:
+            source_removed = False
+        send_message({
+            "type": "audioExtracted",
+            "path": output_path,
+            "format": audio_format,
+            "bytes": os.path.getsize(output_path),
+            "transcoded": transcoded,
+            "sourceRemoved": source_removed,
+        })
+    except OSError as exc:
+        if os.path.isfile(tmp):
+            os.remove(tmp)
+        send_message({"type": "error", "message": f"Could not finalize audio file: {exc}"})
+
+
 def probe_duration(path):
     """Container duration in seconds, or None if ffprobe is unavailable."""
     creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
@@ -254,6 +368,12 @@ def main():
             send_inspection(message.get("path"))
         elif action == "remux":
             run_remux(message.get("path"), message.get("audioPath"))
+        elif action == "extractAudio":
+            run_extract_audio(
+                message.get("path"),
+                message.get("outputName"),
+                message.get("format"),
+            )
         else:
             send_message({"type": "error", "message": "Unsupported native-host action"})
 

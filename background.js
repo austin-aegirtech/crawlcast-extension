@@ -153,10 +153,22 @@ chrome.downloads.onChanged.addListener((delta) => {
   if (entry && (state === 'complete' || state === 'interrupted')) {
     releaseBlobUrl(delta.id);
 
-    // Repair the saved HLS file once it's fully written to disk.
+    // Repair video output or extract the requested audio once the temporary
+    // HLS-produced MP4/M4A has been fully written to disk.
     if (state === 'complete') {
-      remuxDownloadedFile(delta.id, entry.streamUrl).catch((e) =>
-        console.log('[Remux] Skipped:', e.message));
+      if (entry.audioFormat) {
+        extractAudioDownloadedFile(
+          delta.id,
+          entry.streamUrl,
+          entry.audioFormat,
+          entry.audioOutputFilename
+        ).catch((e) => failAudioExtraction(entry.streamUrl, e.message));
+      } else {
+        remuxDownloadedFile(delta.id, entry.streamUrl).catch((e) =>
+          console.log('[Remux] Skipped:', e.message));
+      }
+    } else if (entry.audioFormat) {
+      failAudioExtraction(entry.streamUrl, 'Temporary source download was interrupted');
     }
     return;
   }
@@ -236,11 +248,22 @@ function setActiveDownloadPaused(active, paused) {
 function completeDirectDownload(downloadId, entry) {
   if (!directDownloads.has(downloadId)) return;
   directDownloads.delete(downloadId);
-  activeDownloads.delete(entry.streamUrl);
   persistDirectDownloads();
 
   const stream = detectedStreams.get(entry.streamUrl);
   const format = entry.format || getStreamFormat(stream || entry.streamUrl);
+
+  if (entry.audioFormat) {
+    extractAudioDownloadedFile(
+      downloadId,
+      entry.streamUrl,
+      entry.audioFormat,
+      entry.audioOutputFilename
+    ).catch((e) => failAudioExtraction(entry.streamUrl, e.message));
+    return;
+  }
+
+  activeDownloads.delete(entry.streamUrl);
 
   broadcast({
     action: 'downloadComplete',
@@ -370,6 +393,95 @@ async function remuxDownloadedFile(downloadId, streamUrl) {
   } else {
     startRemux();
   }
+}
+
+function failAudioExtraction(streamUrl, message) {
+  activeDownloads.delete(streamUrl);
+  persistActiveHlsDownloadsNow();
+  broadcast({
+    action: 'audioDownloadError',
+    url: streamUrl,
+    error: message || 'Audio extraction failed. The temporary source file was kept.'
+  });
+  maybeCloseOffscreen();
+}
+
+async function extractAudioDownloadedFile(downloadId, streamUrl, audioFormat, outputFilename) {
+  const [item] = await chrome.downloads.search({ id: downloadId });
+  if (!item || !item.filename) throw new Error('Downloaded source file could not be found');
+
+  const normalizedFormat = audioFormat === 'mp3' ? 'mp3' : 'm4a';
+  const active = activeDownloads.get(streamUrl);
+  if (active) {
+    active.progress = {
+      ...(active.progress || {}),
+      phase: 'extracting-audio',
+      paused: false,
+      percent: 100
+    };
+    active.lastProgressAt = Date.now();
+  }
+
+  broadcast({ action: 'audioExtractionStarted', url: streamUrl, format: normalizedFormat });
+
+  let port;
+  try {
+    port = chrome.runtime.connectNative(NATIVE_HOST);
+  } catch {
+    throw new Error('Native host unavailable — the temporary source file was kept');
+  }
+
+  await new Promise((resolve, reject) => {
+    let finished = false;
+
+    const finish = (callback) => {
+      if (finished) return;
+      finished = true;
+      callback();
+      port.disconnect();
+    };
+
+    port.onMessage.addListener((msg) => {
+      if (msg.type === 'audioExtracted') {
+        finish(() => {
+          activeDownloads.delete(streamUrl);
+          persistActiveHlsDownloadsNow();
+          if (msg.sourceRemoved !== false) {
+            chrome.downloads.erase({ id: downloadId }).catch(() => {});
+          }
+          const filename = String(msg.path || outputFilename || '').split(/[\\/]/).pop();
+          broadcast({
+            action: 'audioDownloadComplete',
+            url: streamUrl,
+            format: normalizedFormat,
+            filename,
+            path: msg.path,
+            transcoded: !!msg.transcoded,
+            sourceRemoved: msg.sourceRemoved !== false
+          });
+          maybeCloseOffscreen();
+          resolve();
+        });
+      } else if (msg.type === 'error') {
+        finish(() => reject(new Error(msg.message || 'Audio extraction failed')));
+      }
+    });
+
+    port.onDisconnect.addListener(() => {
+      const err = chrome.runtime.lastError;
+      if (!finished) {
+        finished = true;
+        reject(new Error(err?.message || 'Native host disconnected during audio extraction'));
+      }
+    });
+
+    port.postMessage({
+      action: 'extractAudio',
+      path: item.filename,
+      outputName: outputFilename,
+      format: normalizedFormat
+    });
+  });
 }
 
 // Thumbnail generation jobs in flight (stream urls)
@@ -869,7 +981,12 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       }
 
       try {
-        await startDownload(request.url, request.filename, sender.tab?.id || request.tabId);
+        await startDownload(
+          request.url,
+          request.filename,
+          sender.tab?.id || request.tabId,
+          request.audioFormat
+        );
         sendResponse({
           success: true,
           downloadId: request.url,
@@ -924,18 +1041,24 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       url: request.blobUrl,
       filename: request.filename
     }).then(async (downloadId) => {
-      activeDownloads.delete(request.streamUrl);
-      persistActiveHlsDownloadsNow();
+      if (!request.audioFormat) {
+        activeDownloads.delete(request.streamUrl);
+        persistActiveHlsDownloadsNow();
+      }
       pendingBlobUrls.set(downloadId, {
         blobUrl: request.blobUrl,
-        streamUrl: request.streamUrl
+        streamUrl: request.streamUrl,
+        audioFormat: request.audioFormat || null,
+        audioOutputFilename: request.audioOutputFilename || null
       });
 
-      chrome.runtime.sendMessage({
-        action: 'downloadComplete',
-        url: request.streamUrl,
-        result: { filename: request.filename }
-      }).catch(() => {});
+      if (!request.audioFormat) {
+        chrome.runtime.sendMessage({
+          action: 'downloadComplete',
+          url: request.streamUrl,
+          result: { filename: request.filename }
+        }).catch(() => {});
+      }
 
       // Small files can finish before we registered them — check state now.
       // If completion was missed by onChanged, run the same remux path here
@@ -946,8 +1069,17 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         releaseBlobUrl(downloadId);
 
         if (item.state === 'complete' && entry) {
-          remuxDownloadedFile(downloadId, entry.streamUrl).catch((e) =>
-            console.log('[Remux] Skipped:', e.message));
+          if (entry.audioFormat) {
+            extractAudioDownloadedFile(
+              downloadId,
+              entry.streamUrl,
+              entry.audioFormat,
+              entry.audioOutputFilename
+            ).catch((e) => failAudioExtraction(entry.streamUrl, e.message));
+          } else {
+            remuxDownloadedFile(downloadId, entry.streamUrl).catch((e) =>
+              console.log('[Remux] Skipped:', e.message));
+          }
         }
       }
     }).catch((err) => {
@@ -1167,14 +1299,28 @@ function broadcast(message) {
  * HLS remains in the offscreen downloader; direct MP4 and PDF files are
  * handed to the browser downloads API. Only MP4 is inspected/remuxed.
  */
-async function startDownload(url, filename, tabId) {
+async function startDownload(url, filename, tabId, requestedAudioFormat = null) {
   await Promise.all([directDownloadsRestored, hlsDownloadsRestored]);
   const stream = detectedStreams.get(url);
   const format = getStreamFormat(stream || url);
+  const audioFormat = requestedAudioFormat === 'mp3'
+    ? 'mp3'
+    : (requestedAudioFormat === 'm4a' ? 'm4a' : null);
+
+  if (requestedAudioFormat && !audioFormat) throw new Error('Unsupported audio format');
+  if (audioFormat && format === 'pdf') throw new Error('PDF files do not contain audio');
+
+  const outputFilename = filename || `audio.${audioFormat || 'mp4'}`;
+  const sourceFilename = audioFormat
+    ? buildAudioSourceFilename(outputFilename, 'mp4')
+    : outputFilename;
 
   if (format === 'mp4' || format === 'pdf') {
     const fallbackName = format === 'pdf' ? 'document.pdf' : 'video.mp4';
-    return startDirectDownload(url, filename || fallbackName, format);
+    return startDirectDownload(url, audioFormat ? sourceFilename : (filename || fallbackName), format, {
+      audioFormat,
+      audioOutputFilename: audioFormat ? outputFilename : null
+    });
   }
 
   if (format !== 'm3u8') throw new Error('Unsupported download format');
@@ -1186,7 +1332,9 @@ async function startDownload(url, filename, tabId) {
     paused: false,
     progress: { percent: 0, downloaded: 0, total: 0, phase: 'downloading', paused: false },
     startTime: Date.now(),
-    lastProgressAt: Date.now()
+    lastProgressAt: Date.now(),
+    audioFormat,
+    audioOutputFilename: audioFormat ? outputFilename : null
   });
   await persistActiveHlsDownloadsNow();
 
@@ -1195,11 +1343,20 @@ async function startDownload(url, filename, tabId) {
     target: 'offscreen',
     action: 'downloadStream',
     url: url,
-    filename: filename || 'video.mp4'
+    filename: audioFormat ? sourceFilename : (filename || 'video.mp4'),
+    audioFormat,
+    audioOutputFilename: audioFormat ? outputFilename : null
   }).catch((err) => console.error('[Offscreen] send failed:', err));
 }
 
-async function startDirectDownload(url, filename, format) {
+function buildAudioSourceFilename(outputFilename, extension) {
+  const base = String(outputFilename || 'audio')
+    .replace(/\.(m4a|mp3)$/i, '')
+    .replace(/[. ]+$/g, '') || 'audio';
+  return `${base}.crawlcast-audio-source.${extension}`;
+}
+
+async function startDirectDownload(url, filename, format, options = {}) {
   activeDownloads.set(url, {
     kind: 'direct',
     paused: false,
@@ -1223,6 +1380,8 @@ async function startDirectDownload(url, filename, format) {
       streamUrl: url,
       filename,
       format,
+      audioFormat: options.audioFormat || null,
+      audioOutputFilename: options.audioOutputFilename || null,
       bytesReceived: 0,
       totalBytes: 0,
       startTime: Date.now(),

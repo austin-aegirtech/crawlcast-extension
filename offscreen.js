@@ -38,7 +38,12 @@ chrome.runtime.onMessage.addListener((request) => {
   if (request.target !== 'offscreen') return;
 
   if (request.action === 'downloadStream') {
-    startDownload(request.url, request.filename);
+    startDownload(
+      request.url,
+      request.filename,
+      request.audioFormat,
+      request.audioOutputFilename
+    );
   }
 
   if (request.action === 'pauseDownload') {
@@ -299,7 +304,7 @@ function captureFrames(src, frameCount = 8) {
 // Live VideoDownloader instances, so cancel requests can reach them
 const runningDownloads = new Map();
 
-function startDownload(url, filename) {
+function startDownload(url, filename, audioFormat = null, audioOutputFilename = null) {
   const downloader = new VideoDownloader({
     onProgress: (progress) => {
       chrome.runtime.sendMessage({
@@ -311,16 +316,31 @@ function startDownload(url, filename) {
 
     onComplete: (result) => {
       runningDownloads.delete(url);
+
+      if (audioFormat && result.audioMissing) {
+        chrome.runtime.sendMessage({
+          action: 'downloadError',
+          url,
+          error: 'The separate HLS audio track could not be downloaded'
+        }).catch(() => {});
+        return;
+      }
+
       // Blob URL stays valid while this document is alive;
       // background downloads it via chrome.downloads
-      const blobUrl = URL.createObjectURL(result.blob);
+      const audioOnlyBlob = audioFormat && result.audioBlob ? result.audioBlob : null;
+      const sourceBlob = audioOnlyBlob || result.blob;
+      const sourceFilename = audioOnlyBlob
+        ? filename.replace(/\.mp4$/i, '.m4a')
+        : filename;
+      const blobUrl = URL.createObjectURL(sourceBlob);
 
       // Streams with a separate audio rendition produce two files that
       // ffmpeg merges afterwards. Saved alongside the video so the native
       // host can find both by path.
       let audioBlobUrl = null;
       let audioFilename = null;
-      if (result.audioBlob) {
+      if (!audioFormat && result.audioBlob) {
         audioBlobUrl = URL.createObjectURL(result.audioBlob);
         audioFilename = result.filename.replace(/\.mp4$/i, '') + '.audio.m4a';
       }
@@ -328,8 +348,10 @@ function startDownload(url, filename) {
       chrome.runtime.sendMessage({
         action: 'saveBlob',
         blobUrl: blobUrl,
-        filename: result.filename,
+        filename: sourceFilename,
         streamUrl: url,
+        audioFormat: audioFormat || null,
+        audioOutputFilename: audioOutputFilename || null,
         audioBlobUrl,
         audioFilename,
         needsAudioMerge: !!result.needsAudioMerge,
