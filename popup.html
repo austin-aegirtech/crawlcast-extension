@@ -37,26 +37,29 @@
         <button class="premium-close" id="premiumClose" type="button" aria-label="Close premium section" title="Close">×</button>
         <div class="premium-heading" id="premiumTitle">
           <span class="premium-gem">💎</span>
-          <span>Get Premium</span>
+          <span id="premiumTitleText">Get Premium</span>
         </div>
-        <p class="premium-description">
-          Unlock premium Crawlcast features and enhanced download options. Premium is being prepared now.
+        <p class="premium-description" id="premiumDescription">
+          Upgrade to remove the free download cooldown.
         </p>
         <div class="premium-footer">
           <div class="premium-note">
             <strong>Premium features</strong><br>
-            Subscription and account support will be added in a future release.
+            <span id="premiumFeatureCopy">Premium unlock: unlimited downloads.</span>
             <div class="premium-limit-countdown" id="premiumLimitCountdown" hidden>
               <span class="premium-limit-dot" aria-hidden="true"></span>
               <span>Free limit reached — next download in <strong id="premiumCountdownValue">60:00</strong></span>
             </div>
           </div>
-          <button class="premium-button" id="premiumBtn" type="button">
-            <span>🔒</span>
-            <span>Get Premium</span>
-          </button>
+          <div class="premium-actions">
+            <button class="premium-refresh" id="premiumRefresh" type="button">Refresh access</button>
+            <button class="premium-button" id="premiumBtn" type="button" data-action="checkout">
+              <span>🔒</span>
+              <span id="premiumBtnLabel">Get Premium</span>
+            </button>
+          </div>
         </div>
-        <div class="premium-status" id="premiumStatus">Premium is coming soon.</div>
+        <div class="premium-status" id="premiumStatus" role="status"></div>
       </section>
 
       <div class="section-heading">

@@ -95,7 +95,9 @@ When the limit is reached:
 
 ### Premium
 
-The Premium card is already present in the UI, but billing and account entitlements are **not connected yet**. The current **Get Premium** action is a coming-soon stub.
+The extension now has a provider-neutral Premium boundary. `premium.js` owns entitlement state and feature checks; `premium-config.js` defines the backend connection points. Premium currently unlocks `unlimited_downloads`.
+
+The payment backend is **not connected yet**. Until `apiBaseUrl` is configured, the extension fails closed to the free plan and clearly reports that checkout is unavailable. See [`docs/premium-integration.md`](docs/premium-integration.md) for the API contract.
 
 A development-only **God Mode** toggle currently exists for unrestricted testing. It is intended as a development convenience, not the final production entitlement system.
 
@@ -329,6 +331,8 @@ Crawlcast intentionally keeps the browser extension side lightweight: vanilla Ja
 crawlcast-extension/
 ├── manifest.json                 # Manifest V3 metadata and permissions
 ├── background.js                 # Detection, rate limit, direct MP4, saves, native messaging
+├── premium-config.js             # Public Premium endpoint configuration
+├── premium.js                    # Entitlement cache, feature gates, checkout/portal boundary
 ├── popup.html                    # Popup structure
 ├── popup.js                      # Popup behavior and UI state
 ├── styles/
@@ -413,7 +417,7 @@ Crawlcast is under active development.
 - **Separate HLS audio:** a native host is required to merge separately delivered audio into the final MP4.
 - **Metadata is best-effort:** thumbnails, resolution, duration, and estimated size depend on what the source exposes.
 - **DRM/encrypted media:** Crawlcast is not a DRM bypass tool and does not promise support for protected streams.
-- **Premium:** the UI exists, but payment, account, and entitlement services are not yet connected.
+- **Premium backend:** feature gates and the extension-side contract exist, but checkout, account identity, webhooks, and the entitlement API still require a server implementation.
 
 ## Troubleshooting
 
@@ -469,7 +473,8 @@ The HLS pipeline currently buffers assembled media in browser memory and enforce
 
 ## Roadmap
 
-- [ ] Connect Premium billing and account entitlements
+- [x] Add provider-neutral Premium entitlement and feature-gate scaffolding
+- [ ] Connect a payment provider and implement the Premium API contract
 - [ ] Remove the development God Mode control from production builds
 - [ ] Build the production Premium feature set
 - [ ] Improve large HLS download handling / reduce browser-memory pressure

@@ -4,7 +4,8 @@
   "private": true,
   "scripts": {
     "prepare": "husky",
-    "commit": "cz"
+    "commit": "cz",
+    "test": "node --test tests/*.test.cjs"
   },
   "config": {
     "commitizen": {

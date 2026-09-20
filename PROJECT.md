@@ -84,8 +84,8 @@ The current branch implements the following behavior.
 - User Mode allows one accepted download start per rolling 60-minute window.
 - A live purple countdown is shown inside the Premium panel after the free limit is hit.
 - **God Mode** bypasses the rate limit and currently exists for development/testing.
-- Premium billing/account entitlement is not implemented yet.
-- The Premium CTA currently reports that Premium is coming soon.
+- Premium feature gates and the extension-side API contract are implemented; the payment/account backend is not connected yet.
+- The Premium CTA routes through the backend contract and reports that checkout is unconfigured until `apiBaseUrl` is set.
 
 ### Downloads
 
@@ -241,6 +241,8 @@ The host is optional for basic download saving, but important for final HLS comp
 crawlcast-extension/
 ├── manifest.json
 ├── background.js
+├── premium-config.js
+├── premium.js
 ├── popup.html
 ├── popup.js
 ├── styles/
@@ -249,7 +251,6 @@ crawlcast-extension/
 ├── offscreen.js
 ├── downloader.js
 ├── m3u8-parser.js
-├── auth.js
 ├── lib/
 │   ├── mux.min.js
 │   └── StreamSaver.min.js
@@ -279,6 +280,8 @@ crawlcast-extension/
 |---|---|
 | `manifest.json` | MV3 metadata, permissions, service-worker entry point, popup, icons. |
 | `background.js` | Main coordinator: detection, storage, User Mode limit, direct MP4, HLS orchestration, browser downloads, logs, native host. |
+| `premium-config.js` | Public Premium API endpoint and cache/timeout configuration. Contains no secrets. |
+| `premium.js` | Provider-neutral entitlement cache, feature gates, checkout URL validation, and portal boundary. |
 | `popup.html` | Popup markup only. Styling lives outside the HTML. |
 | `styles/popup.css` | All popup presentation/layout styling. |
 | `popup.js` | Popup rendering, editable titles, filename generation, mode UI, countdown, progress, logs, controls. |
@@ -294,7 +297,6 @@ crawlcast-extension/
 | `native-host/register-native-host-from-wsl.sh` | WSL helper that invokes the PowerShell registration script. |
 | `tools/remux.sh` | Standalone batch/remux helper, outside the extension runtime. |
 | `tools/Repair-Videos.ps1` | Standalone PowerShell video repair/scan helper, outside the extension runtime. |
-| `auth.js` | Legacy/stub auth code. Not loaded or referenced by the current extension runtime. |
 | `lib/StreamSaver.min.js` | Checked-in legacy library. Not loaded or referenced by the current runtime. |
 
 ---
@@ -464,6 +466,14 @@ The next allowed start is:
 userModeLastDownloadAt + 60 minutes
 ```
 
+### `premiumInstallationId`
+
+Random installation UUID used by the Premium backend contract. It is never returned to popup code or written to diagnostic logs.
+
+### `premiumEntitlement`
+
+Short-lived entitlement cache written only after a successful server response. Active access requires a future `validUntil` timestamp and the explicit `unlimited_downloads` feature.
+
 ## 7.3 Important in-memory-only maps/sets
 
 These are **not** fully persisted:
@@ -614,16 +624,16 @@ At expiry:
 
 ## Premium
 
-The current Premium UI is only product scaffolding.
+Premium now has an extension-side integration boundary:
 
-Not implemented yet:
+- `premium.js` owns entitlement state and feature checks;
+- `premium-config.js` owns public endpoint configuration;
+- the background worker refreshes stale access before enforcing a download start;
+- `unlimited_downloads` bypasses the free cooldown;
+- checkout and portal URLs must come from the backend and must be HTTPS;
+- active/trial access requires a future `validUntil` and otherwise fails closed.
 
-- payment provider integration;
-- customer accounts;
-- subscription creation;
-- entitlement lookup;
-- Premium feature unlocks;
-- restore purchase/sign-in flow.
+The payment provider, account identity, billing webhooks, and server endpoints are still not implemented. The required request/response shapes are documented in `docs/premium-integration.md`.
 
 ---
 
@@ -1425,21 +1435,13 @@ Without the native host:
 
 ## Premium
 
-Premium is visual scaffolding only. No paid entitlement exists yet.
+Premium has UI, entitlement caching, feature gates, and checkout/portal integration points. No payment backend is connected yet, so the default configuration remains on the free plan.
 
 ---
 
 # 22. Unused / stale repository artifacts
 
 These files are present in the current uploaded snapshot but are **not part of the active runtime path**.
-
-## `auth.js`
-
-Contains an old Himitsu/private-test login stub with a mock token and localhost endpoint.
-
-Current searches show no runtime file loads or calls it.
-
-Do not treat this as Crawlcast's current Premium/account implementation.
 
 ## `lib/StreamSaver.min.js`
 
@@ -1648,8 +1650,7 @@ Still required:
 - payment provider;
 - checkout flow;
 - customer identity;
-- entitlement service;
-- extension entitlement refresh/cache;
+- entitlement service implementation behind the documented API contract;
 - subscription lifecycle handling;
 - restore/access-across-devices policy.
 
