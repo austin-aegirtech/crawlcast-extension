@@ -13,11 +13,20 @@ let currentPageTitle = '';
 let currentMode = 'user';
 let userModeNextAllowedAt = 0;
 let rateLimitCountdownTimer = null;
+let premiumState = {
+  tier: 'free',
+  status: 'unconfigured',
+  isPremium: false,
+  providerConfigured: false,
+  features: { unlimitedDownloads: false },
+  error: null
+};
 
 // Initialize
 document.addEventListener('DOMContentLoaded', () => {
   initAppHandlers();
   loadModeState();
+  loadPremiumState();
   loadStreams();
 });
 
@@ -28,7 +37,8 @@ function initAppHandlers() {
   appHandlersInitialized = true;
 
   document.getElementById('clearBtn').addEventListener('click', clearStreams);
-  document.getElementById('premiumBtn').addEventListener('click', showPremiumComingSoon);
+  document.getElementById('premiumBtn').addEventListener('click', handlePremiumPrimaryAction);
+  document.getElementById('premiumRefresh').addEventListener('click', refreshPremiumState);
   document.getElementById('premiumClose').addEventListener('click', closePremium);
   document.getElementById('modeToggle').addEventListener('click', toggleMode);
 
@@ -101,12 +111,99 @@ function initAppHandlers() {
         attachThumbHover(img);
       }
     }
+    if (message.action === 'premiumStateUpdated') {
+      applyPremiumState(message.premium);
+      if (message.modeState) applyModeState(message.modeState);
+    }
   });
 }
 
 async function loadModeState() {
   const response = await chrome.runtime.sendMessage({ action: 'getModeState' }).catch(() => null);
   applyModeState(response?.success ? response : { mode: 'user', nextAllowedAt: 0 });
+}
+
+async function loadPremiumState() {
+  const response = await chrome.runtime.sendMessage({ action: 'getPremiumState' }).catch((error) => ({
+    success: false,
+    error: error?.message || String(error)
+  }));
+  if (response?.success) {
+    applyPremiumState(response.premium);
+  } else if (response?.error) {
+    showPremiumStatus(response.error, true);
+  }
+}
+
+function applyPremiumState(state) {
+  if (!state || typeof state !== 'object') return;
+  premiumState = {
+    ...premiumState,
+    ...state,
+    features: {
+      ...premiumState.features,
+      ...(state.features || {})
+    }
+  };
+
+  const card = document.getElementById('premiumCard');
+  const title = document.getElementById('premiumTitleText');
+  const description = document.getElementById('premiumDescription');
+  const featureCopy = document.getElementById('premiumFeatureCopy');
+  const primary = document.getElementById('premiumBtn');
+  const primaryLabel = document.getElementById('premiumBtnLabel');
+  const refresh = document.getElementById('premiumRefresh');
+  const status = document.getElementById('premiumStatus');
+  const isActive = premiumState.isPremium === true;
+  const hasCustomerAccount = isActive || ['past_due', 'canceled'].includes(premiumState.status);
+
+  card.classList.toggle('active', isActive);
+  title.textContent = isActive ? 'Crawlcast Premium' : 'Get Premium';
+  description.textContent = isActive
+    ? 'Premium access is active on this installation.'
+    : 'Upgrade to remove the free download cooldown.';
+  featureCopy.textContent = isActive
+    ? 'Unlimited downloads are unlocked.'
+    : 'Premium unlock: unlimited downloads.';
+  primary.dataset.action = hasCustomerAccount ? 'portal' : 'checkout';
+  primaryLabel.textContent = hasCustomerAccount ? 'Manage Premium' : 'Get Premium';
+  refresh.disabled = !premiumState.providerConfigured;
+
+  if (premiumState.error) {
+    showPremiumStatus(premiumState.error, true);
+  } else if (!premiumState.providerConfigured) {
+    showPremiumStatus('Checkout connection is not configured yet.');
+  } else if (isActive) {
+    showPremiumStatus(
+      premiumState.status === 'trialing' ? 'Premium trial active.' : 'Premium active.'
+    );
+  } else if (premiumState.status === 'past_due') {
+    showPremiumStatus('Payment needs attention.', true);
+  } else if (premiumState.status === 'expired') {
+    showPremiumStatus('Premium access expired.', true);
+  } else {
+    status.classList.remove('visible', 'error');
+    status.textContent = '';
+  }
+
+  const modeButton = document.getElementById('modeToggle');
+  const modeLabel = document.getElementById('modeLabel');
+  const isGodMode = currentMode === 'god';
+  modeButton.classList.toggle('premium', !isGodMode && isActive);
+  if (!isGodMode) modeLabel.textContent = isActive ? 'Premium' : 'User Mode';
+  syncRateLimitUI();
+}
+
+function showPremiumStatus(message, isError = false) {
+  const status = document.getElementById('premiumStatus');
+  status.textContent = message;
+  status.classList.add('visible');
+  status.classList.toggle('error', isError);
+}
+
+function setPremiumBusy(busy) {
+  document.getElementById('premiumBtn').disabled = busy;
+  document.getElementById('premiumRefresh').disabled = busy || !premiumState.providerConfigured;
 }
 
 async function toggleMode() {
@@ -126,6 +223,7 @@ async function toggleMode() {
 }
 
 function applyModeState(state) {
+  if (state.premium) applyPremiumState(state.premium);
   currentMode = state.mode === 'god' ? 'god' : 'user';
   userModeNextAllowedAt = Number(state.nextAllowedAt) || 0;
 
@@ -133,14 +231,18 @@ function applyModeState(state) {
   const label = document.getElementById('modeLabel');
   const premiumCard = document.getElementById('premiumCard');
   const isGodMode = currentMode === 'god';
+  const isPremium = premiumState.features.unlimitedDownloads === true;
 
   button.classList.toggle('god', isGodMode);
+  button.classList.toggle('premium', !isGodMode && isPremium);
   button.setAttribute('aria-pressed', String(isGodMode));
-  label.textContent = isGodMode ? 'God Mode' : 'User Mode';
+  label.textContent = isGodMode ? 'God Mode' : (isPremium ? 'Premium' : 'User Mode');
   premiumCard.hidden = isGodMode;
 
   if (isGodMode) {
     button.title = 'God Mode — unlimited downloads';
+  } else if (isPremium) {
+    button.title = 'Premium — unlimited downloads';
   } else {
     updateUserModeTitle();
   }
@@ -149,12 +251,19 @@ function applyModeState(state) {
 }
 
 function isUserModeRateLimited() {
-  return currentMode === 'user' && userModeNextAllowedAt > Date.now();
+  return currentMode === 'user' &&
+    premiumState.features.unlimitedDownloads !== true &&
+    userModeNextAllowedAt > Date.now();
 }
 
 function updateUserModeTitle() {
   const button = document.getElementById('modeToggle');
   if (!button || currentMode !== 'user') return;
+
+  if (premiumState.features.unlimitedDownloads === true) {
+    button.title = 'Premium — unlimited downloads';
+    return;
+  }
 
   const remainingMs = Math.max(0, userModeNextAllowedAt - Date.now());
   button.title = remainingMs > 0
@@ -183,7 +292,9 @@ function updateRateLimitCountdown() {
   if (!indicator || !value) return;
 
   const remainingMs = Math.max(0, userModeNextAllowedAt - Date.now());
-  const limited = currentMode === 'user' && remainingMs > 0;
+  const limited = currentMode === 'user' &&
+    premiumState.features.unlimitedDownloads !== true &&
+    remainingMs > 0;
 
   indicator.hidden = !limited;
 
@@ -1001,11 +1112,39 @@ function closePremium() {
   document.getElementById('premiumCard').hidden = true;
 }
 
-function showPremiumComingSoon() {
-  const status = document.getElementById('premiumStatus');
+async function handlePremiumPrimaryAction() {
   const button = document.getElementById('premiumBtn');
-  status.classList.add('visible');
-  button.querySelector('span:last-child').textContent = 'Coming soon';
+  const action = button.dataset.action === 'portal' ? 'openPremiumPortal' : 'startPremiumCheckout';
+  setPremiumBusy(true);
+  showPremiumStatus(action === 'openPremiumPortal'
+    ? 'Opening subscription management…'
+    : 'Opening secure checkout…');
+  try {
+    const response = await chrome.runtime.sendMessage({ action });
+    if (!response?.success) throw new Error(response?.error || 'Premium action failed');
+    showPremiumStatus(action === 'openPremiumPortal'
+      ? 'Subscription management opened in a new tab.'
+      : 'Checkout opened in a new tab. Refresh access after completing it.');
+  } catch (error) {
+    showPremiumStatus(error?.message || String(error), true);
+  } finally {
+    setPremiumBusy(false);
+  }
+}
+
+async function refreshPremiumState() {
+  setPremiumBusy(true);
+  showPremiumStatus('Checking Premium access…');
+  try {
+    const response = await chrome.runtime.sendMessage({ action: 'refreshPremiumState' });
+    if (!response?.success) throw new Error(response?.error || 'Could not refresh Premium access');
+    applyPremiumState(response.premium);
+    if (response.modeState) applyModeState(response.modeState);
+  } catch (error) {
+    showPremiumStatus(error?.message || String(error), true);
+  } finally {
+    setPremiumBusy(false);
+  }
 }
 
 function updateDurationBadge(url, meta) {

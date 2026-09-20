@@ -1,3 +1,5 @@
+importScripts('premium-config.js', 'premium.js');
+
 // Download pipeline runs in offscreen.html (service workers have no DOM);
 // this worker only detects streams and brokers messages.
 // Store detected streams
@@ -116,20 +118,25 @@ const modeStateRestored = chrome.storage.local
     crawlcastMode = data.crawlcastMode === 'god' ? 'god' : 'user';
     userModeLastDownloadAt = Number(data.userModeLastDownloadAt) || 0;
   });
+const premiumStateRestored = CrawlcastPremium.initialize();
 
 function getModeState() {
+  const premium = CrawlcastPremium.getState();
+  const rateLimitExempt = crawlcastMode === 'god' || premium.features.unlimitedDownloads;
   const now = Date.now();
   const nextAllowedAt = userModeLastDownloadAt + USER_MODE_DOWNLOAD_LIMIT_MS;
-  const remainingMs = crawlcastMode === 'user'
+  const remainingMs = !rateLimitExempt
     ? Math.max(0, nextAllowedAt - now)
     : 0;
 
   return {
     mode: crawlcastMode,
+    premium,
+    rateLimitExempt,
     lastDownloadAt: userModeLastDownloadAt,
     nextAllowedAt: remainingMs > 0 ? nextAllowedAt : 0,
     remainingMs,
-    canDownload: crawlcastMode === 'god' || remainingMs === 0
+    canDownload: rateLimitExempt || remainingMs === 0
   };
 }
 
@@ -559,12 +566,20 @@ chrome.webRequest.onHeadersReceived.addListener(
 
 // Update badge
 async function updateBadge(tabId) {
+  if (!Number.isInteger(tabId) || tabId < 0) return;
   const count = Array.from(detectedStreams.values())
     .filter(s => s.tabId === tabId).length;
-  
-  if (count > 0) {
-    chrome.action.setBadgeText({ text: count.toString(), tabId });
-    chrome.action.setBadgeBackgroundColor({ color: '#4CAF50' });
+
+  try {
+    await chrome.action.setBadgeText({
+      text: count > 0 ? count.toString() : '',
+      tabId
+    });
+    if (count > 0) {
+      await chrome.action.setBadgeBackgroundColor({ color: '#4CAF50', tabId });
+    }
+  } catch {
+    // The tab may have closed between detection and this asynchronous update.
   }
 }
 
@@ -590,14 +605,14 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   }
 
   if (request.action === 'getModeState') {
-    modeStateRestored.then(() => {
+    Promise.all([modeStateRestored, premiumStateRestored]).then(() => {
       sendResponse({ success: true, ...getModeState() });
     });
     return true;
   }
 
   if (request.action === 'setMode') {
-    modeStateRestored.then(async () => {
+    Promise.all([modeStateRestored, premiumStateRestored]).then(async () => {
       if (request.mode !== 'user' && request.mode !== 'god') {
         sendResponse({ success: false, error: 'Invalid mode' });
         return;
@@ -606,6 +621,50 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       crawlcastMode = request.mode;
       await chrome.storage.local.set({ crawlcastMode });
       sendResponse({ success: true, ...getModeState() });
+    });
+    return true;
+  }
+
+  if (request.action === 'getPremiumState') {
+    premiumStateRestored.then(async () => {
+      const premium = await CrawlcastPremium.refresh();
+      sendResponse({ success: true, premium });
+    });
+    return true;
+  }
+
+  if (request.action === 'refreshPremiumState') {
+    premiumStateRestored.then(async () => {
+      const premium = await CrawlcastPremium.refresh({ force: true });
+      const state = getModeState();
+      broadcast({ action: 'premiumStateUpdated', premium, modeState: state });
+      sendResponse({ success: true, premium, modeState: state });
+    });
+    return true;
+  }
+
+  if (request.action === 'startPremiumCheckout') {
+    premiumStateRestored.then(async () => {
+      try {
+        const url = await CrawlcastPremium.createCheckoutUrl();
+        await chrome.tabs.create({ url });
+        sendResponse({ success: true });
+      } catch (error) {
+        sendResponse({ success: false, error: error?.message || String(error) });
+      }
+    });
+    return true;
+  }
+
+  if (request.action === 'openPremiumPortal') {
+    premiumStateRestored.then(async () => {
+      try {
+        const url = await CrawlcastPremium.createPortalUrl();
+        await chrome.tabs.create({ url });
+        sendResponse({ success: true });
+      } catch (error) {
+        sendResponse({ success: false, error: error?.message || String(error) });
+      }
     });
     return true;
   }
@@ -630,8 +689,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
       if (changed) {
         persistStreams();
-        updateBadge(request.tabId);
       }
+      // Reapply even when the URL was already known. Chrome may clear a
+      // tab-specific badge while committing a top-level PDF navigation.
+      updateBadge(request.tabId);
       sendResponse({ success: true });
     });
     return true;
@@ -656,8 +717,9 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
               : null
           };
         });
-      sendResponse({ streams });
+      updateBadge(request.tabId).finally(() => sendResponse({ streams }));
     });
+    return true;
   }
 
   // Persist a user-edited title on the detected stream so it survives
@@ -716,11 +778,12 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
   // Start download
   if (request.action === 'startDownload') {
-    modeStateRestored.then(async () => {
+    Promise.all([modeStateRestored, premiumStateRestored]).then(async () => {
+      await CrawlcastPremium.refresh();
       const now = Date.now();
       const state = getModeState();
 
-      if (crawlcastMode === 'user' && !state.canDownload) {
+      if (!state.canDownload) {
         sendResponse({
           success: false,
           reason: 'rate_limit',
@@ -732,7 +795,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       // Consume the User Mode slot as soon as the background accepts the
       // download. This prevents a second popup click/reopen from bypassing
       // the rolling-hour limit while the first download is still running.
-      const consumedUserSlot = crawlcastMode === 'user';
+      const consumedUserSlot = !state.rateLimitExempt;
       if (consumedUserSlot) {
         userModeLastDownloadAt = now;
         await chrome.storage.local.set({ userModeLastDownloadAt });
@@ -1145,11 +1208,14 @@ async function ensureOffscreenDocument() {
 
 // Tab change handling
 chrome.tabs.onActivated.addListener(async (activeInfo) => {
-  const count = Array.from(detectedStreams.values())
-    .filter(s => s.tabId === activeInfo.tabId).length;
-  
-  chrome.action.setBadgeText({ 
-    text: count > 0 ? count.toString() : '', 
-    tabId: activeInfo.tabId 
-  });
+  await streamsRestored;
+  await updateBadge(activeInfo.tabId);
+});
+
+// Top-level PDF detection runs before navigation commits. Chrome can reset
+// tab-specific action state during that commit, so restore the count once the
+// PDF viewer (or any other navigation) has finished loading.
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (changeInfo.status !== 'complete') return;
+  streamsRestored.then(() => updateBadge(tabId));
 });
