@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.3.0](https://github.com/austin-aegirtech/crawlcast-extension/compare/v0.2.1...v0.3.0) (2026-09-20)
+
+
+### Features
+
+* **audio:** enable audio only downloads ([#27](https://github.com/austin-aegirtech/crawlcast-extension/issues/27)) ([b3064a9](https://github.com/austin-aegirtech/crawlcast-extension/commit/b3064a9cc24df5704886ddbcf86c94ab37ea88db))
+
+
+### Bug Fixes
+
+* **thumbnail:** fix thumbnail preview and info in card ([#25](https://github.com/austin-aegirtech/crawlcast-extension/issues/25)) ([fdd10e2](https://github.com/austin-aegirtech/crawlcast-extension/commit/fdd10e2c296daed0e2493fcd13e5ba12610e08f6))
+
 ## [0.2.1](https://github.com/austin-aegirtech/crawlcast-extension/compare/v0.2.0...v0.2.1) (2026-09-20)
 
 
