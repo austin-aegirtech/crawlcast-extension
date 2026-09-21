@@ -173,6 +173,8 @@ def run_remux(path, audio_path=None):
             stderr=subprocess.STDOUT,
             universal_newlines=True,
             creationflags=creationflags,
+            encoding="utf-8",
+            errors="replace",
         )
     except FileNotFoundError:
         send_message({
@@ -295,6 +297,8 @@ def run_extract_audio(path, output_name, audio_format):
                 stderr=subprocess.STDOUT,
                 universal_newlines=True,
                 creationflags=creationflags,
+                encoding="utf-8",
+                errors="replace",
             )
         except FileNotFoundError:
             send_message({"type": "error", "message": f"'{FFMPEG_BIN}' not found on PATH"})
@@ -347,6 +351,8 @@ def probe_duration(path):
              "-of", "default=noprint_wrappers=1:nokey=1", path],
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             universal_newlines=True, creationflags=creationflags,
+            encoding="utf-8",
+            errors="replace",
         )
         return float(out.stdout.strip())
     except (FileNotFoundError, ValueError, OSError):
