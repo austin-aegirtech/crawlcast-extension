@@ -5,7 +5,7 @@
 **Starting commit:**
 **Started:** 2026-09-18
 
-**Release goal:** Create a safe foundation for Premium with controlled DEV/PROD builds, DEV-only God Mode, reliable download accounting, automated checks, and a clean production package.
+**Release goal:** Create a safe foundation for Free and Premium tiers, reliable download accounting, automated checks, and a clean production package.
 
 ---
 
@@ -50,4 +50,4 @@ Both builds loaded successfully in Chrome. PROD contained only approved files.
 None.
 
 **Next:**
-Remove God Mode UI and bypass logic from the PROD build.
+Verify that Premium can only be unlocked by a valid server entitlement.

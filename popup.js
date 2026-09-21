@@ -8,10 +8,10 @@ const thumbFrames = new Map();
 // Current page title is used for card labels and download filenames.
 let currentPageTitle = '';
 
-// Free-tier mode state comes from background.js so closing the popup never
+// Free-tier access state comes from background.js so closing the popup never
 // resets or bypasses the rolling download limit.
-let currentMode = 'user';
-let userModeNextAllowedAt = 0;
+let currentTier = 'free';
+let freeNextAllowedAt = 0;
 let rateLimitCountdownTimer = null;
 let premiumState = {
   tier: 'free',
@@ -25,7 +25,7 @@ let premiumState = {
 // Initialize
 document.addEventListener('DOMContentLoaded', () => {
   initAppHandlers();
-  loadModeState();
+  loadAccessState();
   loadPremiumState();
   loadStreams();
 });
@@ -40,7 +40,7 @@ function initAppHandlers() {
   document.getElementById('premiumBtn').addEventListener('click', handlePremiumPrimaryAction);
   document.getElementById('premiumRefresh').addEventListener('click', refreshPremiumState);
   document.getElementById('premiumClose').addEventListener('click', closePremium);
-  document.getElementById('modeToggle').addEventListener('click', toggleMode);
+  document.getElementById('tierIndicator').addEventListener('click', togglePremiumTestMode);
 
   document.getElementById('logsBtn').addEventListener('click', toggleLogs);
   document.getElementById('logClose').addEventListener('click', () => setLogsOpen(false));
@@ -132,15 +132,18 @@ function initAppHandlers() {
       }
     }
     if (message.action === 'premiumStateUpdated') {
-      applyPremiumState(message.premium);
-      if (message.modeState) applyModeState(message.modeState);
+      if (message.accessState) {
+        applyAccessState(message.accessState);
+      } else {
+        applyPremiumState(message.premium);
+      }
     }
   });
 }
 
-async function loadModeState() {
-  const response = await chrome.runtime.sendMessage({ action: 'getModeState' }).catch(() => null);
-  applyModeState(response?.success ? response : { mode: 'user', nextAllowedAt: 0 });
+async function loadAccessState() {
+  const response = await chrome.runtime.sendMessage({ action: 'getAccessState' }).catch(() => null);
+  applyAccessState(response?.success ? response : { tier: 'free', nextAllowedAt: 0 });
 }
 
 async function loadPremiumState() {
@@ -175,22 +178,32 @@ function applyPremiumState(state) {
   const refresh = document.getElementById('premiumRefresh');
   const status = document.getElementById('premiumStatus');
   const isActive = premiumState.isPremium === true;
-  const hasCustomerAccount = isActive || ['past_due', 'canceled'].includes(premiumState.status);
+  const isTestPremium = premiumState.testModeEnabled === true;
+  const hasCustomerAccount = !isTestPremium &&
+    (isActive || ['past_due', 'canceled'].includes(premiumState.status));
 
   card.classList.toggle('active', isActive);
-  title.textContent = isActive ? 'Crawlcast Premium' : 'Get Premium';
-  description.textContent = isActive
-    ? 'Premium access is active on this installation.'
-    : 'Upgrade to remove the free download cooldown.';
+  card.hidden = isActive;
+  title.textContent = isTestPremium ? 'Crawlcast Premium — Test' : (isActive ? 'Crawlcast Premium' : 'Get Premium');
+  description.textContent = isTestPremium
+    ? 'Development test access is active on this installation.'
+    : (isActive
+      ? 'Premium access is active on this installation.'
+      : 'Upgrade to remove the free download cooldown.');
   featureCopy.textContent = isActive
     ? 'Unlimited downloads are unlocked.'
     : 'Premium unlock: unlimited downloads.';
   primary.dataset.action = hasCustomerAccount ? 'portal' : 'checkout';
-  primaryLabel.textContent = hasCustomerAccount ? 'Manage Premium' : 'Get Premium';
-  refresh.disabled = !premiumState.providerConfigured;
+  primaryLabel.textContent = isTestPremium
+    ? 'Test mode active'
+    : (hasCustomerAccount ? 'Manage Premium' : 'Get Premium');
+  primary.disabled = isTestPremium;
+  refresh.disabled = isTestPremium || !premiumState.providerConfigured;
 
   if (premiumState.error) {
     showPremiumStatus(premiumState.error, true);
+  } else if (isTestPremium) {
+    showPremiumStatus('Premium test mode active. Click Premium above to return to Free.');
   } else if (!premiumState.providerConfigured) {
     showPremiumStatus('Checkout connection is not configured yet.');
   } else if (isActive) {
@@ -206,11 +219,8 @@ function applyPremiumState(state) {
     status.textContent = '';
   }
 
-  const modeButton = document.getElementById('modeToggle');
-  const modeLabel = document.getElementById('modeLabel');
-  const isGodMode = currentMode === 'god';
-  modeButton.classList.toggle('premium', !isGodMode && isActive);
-  if (!isGodMode) modeLabel.textContent = isActive ? 'Premium' : 'User Mode';
+  currentTier = isActive ? 'premium' : 'free';
+  updateTierIndicator();
   syncRateLimitUI();
 }
 
@@ -222,73 +232,76 @@ function showPremiumStatus(message, isError = false) {
 }
 
 function setPremiumBusy(busy) {
-  document.getElementById('premiumBtn').disabled = busy;
-  document.getElementById('premiumRefresh').disabled = busy || !premiumState.providerConfigured;
+  document.getElementById('premiumBtn').disabled = busy || premiumState.testModeEnabled === true;
+  document.getElementById('premiumRefresh').disabled = busy ||
+    premiumState.testModeEnabled === true ||
+    !premiumState.providerConfigured;
 }
 
-async function toggleMode() {
-  const button = document.getElementById('modeToggle');
-  const nextMode = currentMode === 'user' ? 'god' : 'user';
-  button.disabled = true;
+async function togglePremiumTestMode() {
+  if (premiumState.testModeAvailable !== true) return;
+  const indicator = document.getElementById('tierIndicator');
+  indicator.disabled = true;
 
   try {
     const response = await chrome.runtime.sendMessage({
-      action: 'setMode',
-      mode: nextMode
+      action: 'setPremiumTestMode',
+      enabled: premiumState.testModeEnabled !== true
     });
-    if (response?.success) applyModeState(response);
+    if (!response?.success) throw new Error(response?.error || 'Could not change Premium test mode');
+    applyAccessState(response.accessState);
+  } catch (error) {
+    showPremiumStatus(error?.message || String(error), true);
   } finally {
-    button.disabled = false;
+    updateTierIndicator();
   }
 }
 
-function applyModeState(state) {
+function applyAccessState(state) {
   if (state.premium) applyPremiumState(state.premium);
-  currentMode = state.mode === 'god' ? 'god' : 'user';
-  userModeNextAllowedAt = Number(state.nextAllowedAt) || 0;
+  currentTier = state.tier === 'premium' || premiumState.features.unlimitedDownloads === true
+    ? 'premium'
+    : 'free';
+  freeNextAllowedAt = Number(state.nextAllowedAt) || 0;
+  document.getElementById('premiumCard').hidden = premiumState.isPremium === true;
 
-  const button = document.getElementById('modeToggle');
-  const label = document.getElementById('modeLabel');
-  const premiumCard = document.getElementById('premiumCard');
-  const isGodMode = currentMode === 'god';
-  const isPremium = premiumState.features.unlimitedDownloads === true;
-
-  button.classList.toggle('god', isGodMode);
-  button.classList.toggle('premium', !isGodMode && isPremium);
-  button.setAttribute('aria-pressed', String(isGodMode));
-  label.textContent = isGodMode ? 'God Mode' : (isPremium ? 'Premium' : 'User Mode');
-  premiumCard.hidden = isGodMode;
-
-  if (isGodMode) {
-    button.title = 'God Mode — unlimited downloads';
-  } else if (isPremium) {
-    button.title = 'Premium — unlimited downloads';
-  } else {
-    updateUserModeTitle();
-  }
-
+  updateTierIndicator();
   syncRateLimitUI();
 }
 
-function isUserModeRateLimited() {
-  return currentMode === 'user' &&
+function isFreeTierRateLimited() {
+  return currentTier === 'free' &&
     premiumState.features.unlimitedDownloads !== true &&
-    userModeNextAllowedAt > Date.now();
+    freeNextAllowedAt > Date.now();
 }
 
-function updateUserModeTitle() {
-  const button = document.getElementById('modeToggle');
-  if (!button || currentMode !== 'user') return;
+function updateTierIndicator() {
+  const indicator = document.getElementById('tierIndicator');
+  const label = document.getElementById('tierLabel');
+  if (!indicator || !label) return;
 
-  if (premiumState.features.unlimitedDownloads === true) {
-    button.title = 'Premium — unlimited downloads';
+  const isPremium = currentTier === 'premium' || premiumState.features.unlimitedDownloads === true;
+  const testable = premiumState.testModeAvailable === true;
+  indicator.classList.toggle('premium', isPremium);
+  indicator.classList.toggle('testable', testable);
+  indicator.disabled = !testable;
+  indicator.setAttribute('aria-pressed', String(isPremium));
+  label.textContent = isPremium ? 'Premium' : 'Free';
+  if (testable) {
+    indicator.title = isPremium
+      ? 'Premium test mode — click to switch to Free'
+      : 'Free test mode — click to switch to Premium';
+    return;
+  }
+  if (isPremium) {
+    indicator.title = 'Premium — unlimited downloads';
     return;
   }
 
-  const remainingMs = Math.max(0, userModeNextAllowedAt - Date.now());
-  button.title = remainingMs > 0
-    ? `User Mode — next download available in ${formatRemainingTime(remainingMs)}`
-    : 'User Mode — 1 download per hour';
+  const remainingMs = Math.max(0, freeNextAllowedAt - Date.now());
+  indicator.title = remainingMs > 0
+    ? `Free — next download available in ${formatRemainingTime(remainingMs)}`
+    : 'Free — 1 download per hour';
 }
 
 function syncRateLimitUI() {
@@ -299,7 +312,7 @@ function syncRateLimitUI() {
 
   updateRateLimitCountdown();
 
-  if (!isUserModeRateLimited()) return;
+  if (!isFreeTierRateLimited()) return;
 
   rateLimitCountdownTimer = setInterval(() => {
     updateRateLimitCountdown();
@@ -311,8 +324,8 @@ function updateRateLimitCountdown() {
   const value = document.getElementById('premiumCountdownValue');
   if (!indicator || !value) return;
 
-  const remainingMs = Math.max(0, userModeNextAllowedAt - Date.now());
-  const limited = currentMode === 'user' &&
+  const remainingMs = Math.max(0, freeNextAllowedAt - Date.now());
+  const limited = currentTier === 'free' &&
     premiumState.features.unlimitedDownloads !== true &&
     remainingMs > 0;
 
@@ -332,15 +345,15 @@ function updateRateLimitCountdown() {
       clearInterval(rateLimitCountdownTimer);
       rateLimitCountdownTimer = null;
     }
-    if (currentMode === 'user' && userModeNextAllowedAt > 0) {
-      userModeNextAllowedAt = 0;
+    if (currentTier === 'free' && freeNextAllowedAt > 0) {
+      freeNextAllowedAt = 0;
     }
-    updateUserModeTitle();
+    updateTierIndicator();
     return;
   }
 
   value.textContent = formatCountdown(remainingMs);
-  updateUserModeTitle();
+  updateTierIndicator();
 }
 
 async function loadStreams() {
@@ -489,7 +502,7 @@ function renderStreams(streams, tabId, pageTitle = currentPageTitle) {
     const isPaused = isDownloading && (
       activeState?.paused === true || activeState?.progress?.phase === 'paused'
     );
-    const isRateLimited = isUserModeRateLimited();
+    const isRateLimited = isFreeTierRateLimited();
     const hash = hashCode(stream.url);
     const displayTitle = getStreamTitle(stream, pageTitle);
     const duration = stream.meta?.durationSeconds
@@ -512,7 +525,7 @@ function renderStreams(streams, tabId, pageTitle = currentPageTitle) {
     const formatLabel = streamFormat === 'pdf' ? 'PDF' : (streamFormat === 'mp4' ? 'MP4' : 'M3U8');
 
     return `
-      <article class="stream-item" data-url="${escapeHtml(stream.url)}">
+      <article class="stream-item ${isDownloading ? 'active' : ''}" data-url="${escapeHtml(stream.url)}">
         <div class="stream-row">
           <div class="stream-thumb-wrap">
             ${thumb}
@@ -902,7 +915,7 @@ async function startDownload(url, tabId, format) {
   currentPageTitle = tab?.title || currentPageTitle;
   const filename = buildDownloadFilename(getCardTitle(url), format);
 
-  // Ask the background worker first. User Mode is enforced there so popup
+  // Ask the background worker first. Free-tier access is enforced there so popup
   // closes/reopens cannot reset or bypass the rolling-hour limit.
   const startResult = await chrome.runtime.sendMessage({
     action: 'startDownload',
@@ -911,14 +924,14 @@ async function startDownload(url, tabId, format) {
     tabId: parseInt(tabId)
   });
 
-  if (startResult?.mode) applyModeState(startResult);
+  if (startResult?.tier) applyAccessState(startResult);
 
   if (!startResult?.success) {
     if (startResult?.reason === 'rate_limit') {
       setStatus(
         url,
         'status-warn',
-        `⏱️ User Mode allows 1 download per hour. Try again in ${formatRemainingTime(startResult.remainingMs)}.`
+        `⏱️ Free allows 1 download per hour. Try again in ${formatRemainingTime(startResult.remainingMs)}.`
       );
       return;
     }
@@ -955,13 +968,13 @@ async function startAudioDownload(url, tabId) {
     tabId: parseInt(tabId)
   });
 
-  if (startResult?.mode) applyModeState(startResult);
+  if (startResult?.tier) applyAccessState(startResult);
   if (!startResult?.success) {
     if (startResult?.reason === 'rate_limit') {
       setStatus(
         url,
         'status-warn',
-        `⏱️ User Mode allows 1 download per hour. Try again in ${formatRemainingTime(startResult.remainingMs)}.`
+        `⏱️ Free allows 1 download per hour. Try again in ${formatRemainingTime(startResult.remainingMs)}.`
       );
       return;
     }
@@ -1169,7 +1182,7 @@ function markAudioDownloadComplete(url) {
   const videoBtn = document.getElementById(`download-${hash}`);
   if (videoBtn) {
     videoBtn.dataset.state = 'idle';
-    videoBtn.disabled = isUserModeRateLimited();
+    videoBtn.disabled = isFreeTierRateLimited();
     videoBtn.innerHTML = '<span class="download-icon">↓</span><span>Download</span>';
   }
 
@@ -1177,7 +1190,7 @@ function markAudioDownloadComplete(url) {
   const audioSelect = document.getElementById(`audio-format-${hash}`);
   if (audioBtn) {
     audioBtn.dataset.state = 'idle';
-    audioBtn.disabled = isUserModeRateLimited();
+    audioBtn.disabled = isFreeTierRateLimited();
     audioBtn.textContent = 'Saved!';
     setTimeout(() => { audioBtn.textContent = 'Audio only'; }, 1800);
   }
@@ -1199,7 +1212,7 @@ function markAudioDownloadFailed(url) {
   ]) {
     if (!button) continue;
     button.dataset.state = 'idle';
-    button.disabled = isUserModeRateLimited();
+    button.disabled = isFreeTierRateLimited();
   }
   const audioBtn = document.getElementById(`audio-${hash}`);
   if (audioBtn) audioBtn.textContent = 'Audio only';
@@ -1221,7 +1234,7 @@ function markRepairSkipped(url) {
   const btn = document.getElementById(`download-${hash}`);
   if (btn) {
     btn.dataset.state = 'idle';
-    btn.disabled = isUserModeRateLimited();
+    btn.disabled = isFreeTierRateLimited();
     btn.innerHTML = '<span class="download-icon">↓</span><span>Download</span>';
   }
 }
@@ -1362,7 +1375,7 @@ async function refreshPremiumState() {
     const response = await chrome.runtime.sendMessage({ action: 'refreshPremiumState' });
     if (!response?.success) throw new Error(response?.error || 'Could not refresh Premium access');
     applyPremiumState(response.premium);
-    if (response.modeState) applyModeState(response.modeState);
+    if (response.accessState) applyAccessState(response.accessState);
   } catch (error) {
     showPremiumStatus(error?.message || String(error), true);
   } finally {

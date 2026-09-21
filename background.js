@@ -105,35 +105,42 @@ const hlsDownloadsRestored = chrome.storage.session.get('activeHlsDownloads').th
   }
 });
 
-// Free-tier mode state. User Mode allows one accepted download start per
-// rolling 60-minute window; God Mode bypasses the limit. Keep this in
-// storage.local so the limit survives popup closes and browser restarts.
-const USER_MODE_DOWNLOAD_LIMIT_MS = 60 * 60 * 1000;
-let crawlcastMode = 'user';
-let userModeLastDownloadAt = 0;
+// Free allows one accepted download start per rolling 60-minute window.
+// Premium entitlement bypasses the limit. Keep the timestamp in storage.local
+// so the limit survives popup closes and browser restarts.
+const FREE_DOWNLOAD_LIMIT_MS = 60 * 60 * 1000;
+let freeLastDownloadAt = 0;
 
-const modeStateRestored = chrome.storage.local
-  .get(['crawlcastMode', 'userModeLastDownloadAt'])
-  .then((data) => {
-    crawlcastMode = data.crawlcastMode === 'god' ? 'god' : 'user';
-    userModeLastDownloadAt = Number(data.userModeLastDownloadAt) || 0;
+const accessStateRestored = chrome.storage.local
+  .get(['freeLastDownloadAt', 'userModeLastDownloadAt'])
+  .then(async (data) => {
+    const storedFreeTimestamp = Number(data.freeLastDownloadAt);
+    const legacyTimestamp = Number(data.userModeLastDownloadAt);
+    freeLastDownloadAt = Number.isFinite(storedFreeTimestamp) && storedFreeTimestamp > 0
+      ? storedFreeTimestamp
+      : (Number.isFinite(legacyTimestamp) && legacyTimestamp > 0 ? legacyTimestamp : 0);
+
+    if (freeLastDownloadAt > 0 && !(storedFreeTimestamp > 0)) {
+      await chrome.storage.local.set({ freeLastDownloadAt });
+    }
+    await chrome.storage.local.remove(['crawlcastMode', 'userModeLastDownloadAt']);
   });
 const premiumStateRestored = CrawlcastPremium.initialize();
 
-function getModeState() {
+function getAccessState() {
   const premium = CrawlcastPremium.getState();
-  const rateLimitExempt = crawlcastMode === 'god' || premium.features.unlimitedDownloads;
+  const rateLimitExempt = premium.features.unlimitedDownloads;
   const now = Date.now();
-  const nextAllowedAt = userModeLastDownloadAt + USER_MODE_DOWNLOAD_LIMIT_MS;
+  const nextAllowedAt = freeLastDownloadAt + FREE_DOWNLOAD_LIMIT_MS;
   const remainingMs = !rateLimitExempt
     ? Math.max(0, nextAllowedAt - now)
     : 0;
 
   return {
-    mode: crawlcastMode,
+    tier: rateLimitExempt ? 'premium' : 'free',
     premium,
     rateLimitExempt,
-    lastDownloadAt: userModeLastDownloadAt,
+    lastDownloadAt: freeLastDownloadAt,
     nextAllowedAt: remainingMs > 0 ? nextAllowedAt : 0,
     remainingMs,
     canDownload: rateLimitExempt || remainingMs === 0
@@ -752,23 +759,23 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return false;
   }
 
-  if (request.action === 'getModeState') {
-    Promise.all([modeStateRestored, premiumStateRestored]).then(() => {
-      sendResponse({ success: true, ...getModeState() });
+  if (request.action === 'getAccessState') {
+    Promise.all([accessStateRestored, premiumStateRestored]).then(() => {
+      sendResponse({ success: true, ...getAccessState() });
     });
     return true;
   }
 
-  if (request.action === 'setMode') {
-    Promise.all([modeStateRestored, premiumStateRestored]).then(async () => {
-      if (request.mode !== 'user' && request.mode !== 'god') {
-        sendResponse({ success: false, error: 'Invalid mode' });
-        return;
+  if (request.action === 'setPremiumTestMode') {
+    Promise.all([accessStateRestored, premiumStateRestored]).then(async () => {
+      try {
+        const premium = await CrawlcastPremium.setTestPremiumEnabled(request.enabled === true);
+        const state = getAccessState();
+        broadcast({ action: 'premiumStateUpdated', premium, accessState: state });
+        sendResponse({ success: true, premium, accessState: state });
+      } catch (error) {
+        sendResponse({ success: false, error: error?.message || String(error) });
       }
-
-      crawlcastMode = request.mode;
-      await chrome.storage.local.set({ crawlcastMode });
-      sendResponse({ success: true, ...getModeState() });
     });
     return true;
   }
@@ -782,11 +789,11 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   }
 
   if (request.action === 'refreshPremiumState') {
-    premiumStateRestored.then(async () => {
+    Promise.all([accessStateRestored, premiumStateRestored]).then(async () => {
       const premium = await CrawlcastPremium.refresh({ force: true });
-      const state = getModeState();
-      broadcast({ action: 'premiumStateUpdated', premium, modeState: state });
-      sendResponse({ success: true, premium, modeState: state });
+      const state = getAccessState();
+      broadcast({ action: 'premiumStateUpdated', premium, accessState: state });
+      sendResponse({ success: true, premium, accessState: state });
     });
     return true;
   }
@@ -957,10 +964,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
   // Start download
   if (request.action === 'startDownload') {
-    Promise.all([modeStateRestored, premiumStateRestored]).then(async () => {
+    Promise.all([accessStateRestored, premiumStateRestored]).then(async () => {
       await CrawlcastPremium.refresh();
       const now = Date.now();
-      const state = getModeState();
+      const state = getAccessState();
 
       if (!state.canDownload) {
         sendResponse({
@@ -971,13 +978,13 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         return;
       }
 
-      // Consume the User Mode slot as soon as the background accepts the
+      // Consume the Free-tier slot as soon as the background accepts the
       // download. This prevents a second popup click/reopen from bypassing
       // the rolling-hour limit while the first download is still running.
-      const consumedUserSlot = !state.rateLimitExempt;
-      if (consumedUserSlot) {
-        userModeLastDownloadAt = now;
-        await chrome.storage.local.set({ userModeLastDownloadAt });
+      const consumedFreeSlot = !state.rateLimitExempt;
+      if (consumedFreeSlot) {
+        freeLastDownloadAt = now;
+        await chrome.storage.local.set({ freeLastDownloadAt });
       }
 
       try {
@@ -990,16 +997,16 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         sendResponse({
           success: true,
           downloadId: request.url,
-          ...getModeState()
+          ...getAccessState()
         });
       } catch (err) {
         // If Crawlcast could not even start its download pipeline, give the
-        // User Mode slot back. Later network/download failures still count.
-        if (consumedUserSlot && userModeLastDownloadAt === now) {
-          userModeLastDownloadAt = 0;
-          await chrome.storage.local.set({ userModeLastDownloadAt: 0 });
+        // Free-tier slot back. Later network/download failures still count.
+        if (consumedFreeSlot && freeLastDownloadAt === now) {
+          freeLastDownloadAt = 0;
+          await chrome.storage.local.set({ freeLastDownloadAt: 0 });
         }
-        sendResponse({ success: false, error: err?.message || String(err), ...getModeState() });
+        sendResponse({ success: false, error: err?.message || String(err), ...getAccessState() });
       }
     });
     return true;
