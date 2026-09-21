@@ -30,7 +30,7 @@ This file is intentionally developer-focused. `README.md` is the customer/develo
 6. [Media detection](#6-media-detection)
 7. [State and persistence](#7-state-and-persistence)
 8. [Popup UI](#8-popup-ui)
-9. [User Mode, God Mode, and Premium scaffolding](#9-user-mode-god-mode-and-premium-scaffolding)
+9. [Free and Premium scaffolding](#9-free-and-premium-scaffolding)
 10. [Direct MP4 pipeline](#10-direct-mp4-pipeline)
 11. [HLS / M3U8 pipeline](#11-hls--m3u8-pipeline)
 12. [Playlist parsing](#12-playlist-parsing)
@@ -80,10 +80,10 @@ The current branch implements the following behavior.
 
 ### Free / Premium scaffolding
 
-- **User Mode is the default.**
-- User Mode allows one accepted download start per rolling 60-minute window.
+- **Free is the default tier.**
+- Free allows one accepted download start per rolling 60-minute window.
 - A live purple countdown is shown inside the Premium panel after the free limit is hit.
-- **God Mode** bypasses the rate limit and currently exists for development/testing.
+- **Premium** bypasses the rate limit with a valid server entitlement or the explicitly enabled development simulator.
 - Premium feature gates and the extension-side API contract are implemented; the payment/account backend is not connected yet.
 - The Premium CTA routes through the backend contract and reports that checkout is unconfigured until `apiBaseUrl` is set.
 
@@ -168,7 +168,7 @@ It owns or coordinates:
 - media request detection;
 - detected stream registry;
 - browser toolbar badge state;
-- User Mode rate limiting;
+- Free-tier rate limiting;
 - direct MP4 downloads;
 - HLS download startup;
 - download progress bookkeeping;
@@ -194,7 +194,7 @@ It is responsible for:
 - collecting title edits;
 - constructing safe output filenames;
 - displaying User/God mode;
-- displaying the User Mode cooldown;
+- displaying the Free-tier cooldown;
 - starting/cancelling downloads;
 - showing download progress;
 - showing repair/finalization status;
@@ -279,7 +279,7 @@ crawlcast-extension/
 | File | Current responsibility |
 |---|---|
 | `manifest.json` | MV3 metadata, permissions, service-worker entry point, popup, icons. |
-| `background.js` | Main coordinator: detection, storage, User Mode limit, direct MP4, HLS orchestration, browser downloads, logs, native host. |
+| `background.js` | Main coordinator: detection, storage, Free-tier limit, direct MP4, HLS orchestration, browser downloads, logs, native host. |
 | `premium-config.js` | Public Premium API endpoint and cache/timeout configuration. Contains no secrets. |
 | `premium.js` | Provider-neutral entitlement cache, feature gates, checkout URL validation, and portal boundary. |
 | `popup.html` | Popup markup only. Styling lives outside the HTML. |
@@ -446,24 +446,14 @@ Up to 400 centralized diagnostic log entries.
 
 Persists across browser restarts.
 
-### `crawlcastMode`
+### `freeLastDownloadAt`
 
-Current value:
-
-```text
-user | god
-```
-
-Invalid/missing values fall back to `user`.
-
-### `userModeLastDownloadAt`
-
-Timestamp of the last accepted User Mode download start.
+Timestamp of the last accepted Free-tier download start.
 
 The next allowed start is:
 
 ```text
-userModeLastDownloadAt + 60 minutes
+freeLastDownloadAt + 60 minutes
 ```
 
 ### `premiumInstallationId`
@@ -581,30 +571,30 @@ The old main Refresh button has been intentionally removed.
 
 ---
 
-# 9. User Mode, God Mode, and Premium scaffolding
+# 9. Free and Premium scaffolding
 
 Rate limiting is enforced in `background.js`, not merely in the popup.
 
 That matters because closing/reopening the popup must not bypass the free-tier limit.
 
 ```js
-const USER_MODE_DOWNLOAD_LIMIT_MS = 60 * 60 * 1000;
-let crawlcastMode = 'user';
+const FREE_DOWNLOAD_LIMIT_MS = 60 * 60 * 1000;
+let freeLastDownloadAt = 0;
 ```
 
-## User Mode
+## Free
 
-- Default mode.
+- Default tier.
 - One accepted download start per rolling hour.
 - The slot is consumed when `background.js` accepts the start request.
 - If the pipeline cannot even start, the slot is returned.
 - Later network/download failures still count as the consumed attempt.
 
-## God Mode
+## Premium
 
-- Bypasses the time limit.
-- Exists as a development/testing tool.
-- Intended to be removed from the public production UI before store release.
+- Bypasses the time limit only with an active server entitlement.
+- Unlocks through the `unlimited_downloads` feature gate.
+- Cannot be enabled from a local popup toggle.
 
 ## Countdown
 
@@ -614,7 +604,7 @@ When limited:
 
 - idle download buttons are disabled;
 - the Premium panel displays the purple countdown;
-- the mode-toggle tooltip reports remaining time.
+- the tier indicator tooltip reports remaining time.
 
 At expiry:
 
@@ -1231,12 +1221,12 @@ This section is the current reference.
 
 | Action | Main fields | Purpose |
 |---|---|---|
-| `getModeState` | — | Read User/God mode and cooldown. |
-| `setMode` | `mode` | Switch `user` / `god`. |
+| `getAccessState` | — | Read Free/Premium tier and cooldown. |
+| `setPremiumTestMode` | `enabled` | Toggle the development-only Premium entitlement simulator when enabled by configuration. |
 | `getStreams` | `tabId` | Get current tab's detected streams + live download flag. |
 | `setStreamTitle` | `url`, `title` | Persist editable title. |
 | `clearStreams` | `tabId` | Remove safe stream entries for current tab. |
-| `startDownload` | `url`, `filename`, `tabId` | Enforce mode and route MP4/HLS start. |
+| `startDownload` | `url`, `filename`, `tabId` | Enforce tier access and route MP4/HLS start. |
 | `generateThumbnails` | `tabId`, `urls` | Queue HLS analysis/preview. |
 | `cancelDownload` | `url` | Cancel direct browser download or offscreen HLS downloader. |
 | `getLogs` | — | Read centralized diagnostic buffer. |
@@ -1556,16 +1546,16 @@ Changes to Crawlcast should be tested against both download paths.
 - [ ] Clear does not kill a healthy active download.
 - [ ] Logs open as floating panel.
 
-## User Mode
+## Free tier
 
-- [ ] Fresh/default mode is User.
+- [ ] Fresh/default tier is Free.
 - [ ] First download is accepted.
 - [ ] Second download within the hour is blocked.
 - [ ] Purple countdown appears in Premium panel.
 - [ ] Countdown updates every second.
 - [ ] Buttons re-enable at expiry.
 - [ ] Closing/reopening popup does not reset limit.
-- [ ] God Mode bypasses limit during development.
+- [ ] Active Premium entitlement bypasses the limit.
 
 ## Direct MP4
 
@@ -1631,16 +1621,15 @@ Current snapshot still needs production review for:
 - permission justification;
 - versioning/release process.
 
-### God Mode
+### Tier enforcement
 
-The customer-facing God Mode toggle should not ship as the mechanism for bypassing the free limit.
+Production builds do not expose a manual mechanism for bypassing the Free limit. The POC can explicitly enable a development-only Premium simulator in `premium-config.js`.
 
 The planned production model is:
 
 ```text
-Free/User entitlement → 1 download per hour
-Premium entitlement   → paid limits/features
-Development override  → internal only
+Free entitlement    → 1 download per hour
+Premium entitlement → paid limits/features
 ```
 
 ### Premium backend

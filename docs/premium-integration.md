@@ -100,6 +100,8 @@ The extension accepts only HTTPS action URLs, except localhost during developmen
 
 ## Current feature gate
 
-`unlimited_downloads` bypasses the one-download-per-hour free limit. The background service worker enforces this; the popup only reflects the result.
+`unlimited_downloads` bypasses the one-download-per-hour Free limit. The background service worker enforces this; the popup only reflects the result.
 
-God Mode remains a separate development override and is not a paid entitlement.
+## Development test mode
+
+Set `enablePremiumTestMode: true` in `premium-config.js` to make the header tier indicator clickable. It simulates the same `unlimitedDownloads` feature used by a real Premium entitlement and persists across popup closes. Set the flag to `false` before packaging a production build; the Premium service defaults this flag to disabled and rejects test-toggle requests when it is off.

@@ -82,9 +82,9 @@ When the optional native host is installed, Crawlcast can also inspect the finis
 
 Crawlcast currently includes the product scaffolding for a free and Premium experience.
 
-### User Mode
+### Free
 
-**User Mode is the default.** It allows one accepted download start per rolling 60-minute window.
+**Free is the default tier.** It allows one accepted download start per rolling 60-minute window.
 
 When the limit is reached:
 
@@ -99,7 +99,7 @@ The extension now has a provider-neutral Premium boundary. `premium.js` owns ent
 
 The payment backend is **not connected yet**. Until `apiBaseUrl` is configured, the extension fails closed to the free plan and clearly reports that checkout is unavailable. See [`docs/premium-integration.md`](docs/premium-integration.md) for the API contract.
 
-A development-only **God Mode** toggle currently exists for unrestricted testing. It is intended as a development convenience, not the final production entitlement system.
+This POC enables a development-only Premium simulator in `premium-config.js`. Click the **Free / Premium** tier indicator in the header to test Premium UI and unlimited-download behavior without a billing backend. Set `enablePremiumTestMode` to `false` before creating a production build; production Premium access then requires an active backend entitlement.
 
 ## Install
 
@@ -230,7 +230,7 @@ Browser media request
 
 | Stage | Primary files | Responsibility |
 |---|---|---|
-| Detect | `background.js` | Watches browser requests, identifies HLS/direct MP4 media, stores stream state, enforces User Mode rate limiting, and coordinates downloads. |
+| Detect | `background.js` | Watches browser requests, identifies HLS/direct MP4 media, stores stream state, enforces Free-tier rate limiting, and coordinates downloads. |
 | Present | `popup.html`, `styles/popup.css`, `popup.js` | Renders stream cards, editable titles, Premium UI, countdowns, progress, floating logs, and controls. |
 | Parse HLS | `m3u8-parser.js` | Parses HLS master/media playlists and resolves variants, segments, and separate audio renditions. |
 | Download HLS | `downloader.js` | Fetches HLS media segments, retries failures, reports progress, and prepares output chunks. |
@@ -354,15 +354,14 @@ crawlcast-extension/
     └── Repair-Videos.ps1         # Windows video repair/scan helper
 ```
 
-### User Mode and God Mode
+### Free and Premium
 
 Rate-limit state is stored in `chrome.storage.local` so it survives popup closes and browser restarts.
 
-- `user` is the default mode.
-- User Mode permits one accepted download start every 60 minutes.
+- Free is the default tier and permits one accepted download start every 60 minutes.
 - The free slot is consumed as soon as the background service worker accepts the download.
 - The popup calculates the remaining cooldown from the stored next-allowed timestamp.
-- `god` bypasses the cooldown and currently exists for development/testing.
+- Premium bypasses the cooldown when the backend returns an active entitlement with `unlimited_downloads`, or while the explicitly enabled development simulator is active.
 
 ### Reloading changes
 
@@ -389,7 +388,7 @@ Crawlcast currently requests:
 | Permission | Why it is used |
 |---|---|
 | `webRequest` | Observe browser media requests so HLS playlists and direct MP4 URLs can be detected. |
-| `storage` | Preserve detected-stream/session state and User Mode rate-limit state. |
+| `storage` | Preserve detected-stream/session state and Free-tier rate-limit state. |
 | `activeTab` | Scope the popup to the active page and use its title for stream labels/filenames. |
 | `downloads` | Save assembled HLS files and direct MP4 media through the browser download manager. |
 | `offscreen` | Run HLS media work that requires DOM-capable APIs unavailable to the MV3 service worker. |
@@ -433,11 +432,9 @@ Crawlcast is under active development.
 </details>
 
 <details>
-<summary><strong>User Mode says the free limit was reached</strong></summary>
+<summary><strong>Free says the download limit was reached</strong></summary>
 
-User Mode permits one accepted download every rolling 60 minutes. The purple timer under the Premium features section shows the remaining cooldown and updates automatically.
-
-God Mode currently bypasses this restriction for development/testing.
+Free permits one accepted download every rolling 60 minutes. The timer under the Premium features section shows the remaining cooldown and updates automatically. An active Premium entitlement removes this restriction.
 
 </details>
 
@@ -475,7 +472,7 @@ The HLS pipeline currently buffers assembled media in browser memory and enforce
 
 - [x] Add provider-neutral Premium entitlement and feature-gate scaffolding
 - [ ] Connect a payment provider and implement the Premium API contract
-- [ ] Remove the development God Mode control from production builds
+- [x] Remove the legacy manual tier-bypass control
 - [ ] Build the production Premium feature set
 - [ ] Improve large HLS download handling / reduce browser-memory pressure
 - [ ] Add broader compatibility and regression testing

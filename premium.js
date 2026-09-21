@@ -2,6 +2,7 @@
 // server; the extension only asks for checkout URLs and entitlement state.
 (() => {
   const config = Object.freeze({
+    enablePremiumTestMode: false,
     apiBaseUrl: '',
     checkoutPath: '/v1/premium/checkout',
     entitlementPath: '/v1/premium/entitlement',
@@ -13,7 +14,8 @@
 
   const STORAGE = Object.freeze({
     installationId: 'premiumInstallationId',
-    entitlement: 'premiumEntitlement'
+    entitlement: 'premiumEntitlement',
+    testPremiumEnabled: 'premiumTestEnabled'
   });
   const ACTIVE_STATUSES = new Set(['active', 'trialing']);
   const KNOWN_STATUSES = new Set([
@@ -31,6 +33,7 @@
   let initialized = false;
   let initialization = null;
   let refreshInFlight = null;
+  let testPremiumEnabled = false;
 
   function isConfigured() {
     try {
@@ -58,6 +61,18 @@
     };
   }
 
+  function createTestPremiumState() {
+    return createFreeState({
+      tier: 'premium',
+      status: 'active',
+      isPremium: true,
+      features: {
+        unlimitedDownloads: true
+      },
+      error: null
+    });
+  }
+
   function publicState(state = snapshot) {
     return {
       tier: state.tier,
@@ -68,7 +83,9 @@
       checkedAt: state.checkedAt,
       refreshAfter: state.refreshAfter,
       validUntil: state.validUntil,
-      error: state.error || null
+      error: state.error || null,
+      testModeAvailable: config.enablePremiumTestMode === true,
+      testModeEnabled: config.enablePremiumTestMode === true && testPremiumEnabled
     };
   }
 
@@ -110,8 +127,11 @@
     initialization = (async () => {
       const stored = await chrome.storage.local.get([
         STORAGE.installationId,
-        STORAGE.entitlement
+        STORAGE.entitlement,
+        STORAGE.testPremiumEnabled
       ]);
+      testPremiumEnabled = config.enablePremiumTestMode === true &&
+        stored[STORAGE.testPremiumEnabled] === true;
       installationId = typeof stored[STORAGE.installationId] === 'string'
         ? stored[STORAGE.installationId]
         : '';
@@ -128,6 +148,7 @@
       } else {
         snapshot = createFreeState();
       }
+      if (testPremiumEnabled) snapshot = createTestPremiumState();
       initialized = true;
       return publicState();
     })();
@@ -170,6 +191,10 @@
 
   async function refresh({ force = false } = {}) {
     await initialize();
+    if (testPremiumEnabled) {
+      snapshot = createTestPremiumState();
+      return publicState();
+    }
     if (!isConfigured()) {
       snapshot = createFreeState();
       return publicState();
@@ -225,10 +250,31 @@
     return snapshot.features?.[feature] === true;
   }
 
+  async function setTestPremiumEnabled(enabled) {
+    await initialize();
+    if (config.enablePremiumTestMode !== true) {
+      throw new Error('Premium test mode is disabled in this build.');
+    }
+
+    testPremiumEnabled = enabled === true;
+    await chrome.storage.local.set({
+      [STORAGE.testPremiumEnabled]: testPremiumEnabled
+    });
+
+    if (testPremiumEnabled) {
+      snapshot = createTestPremiumState();
+      return publicState();
+    }
+
+    snapshot = createFreeState();
+    return refresh({ force: true });
+  }
+
   globalThis.CrawlcastPremium = Object.freeze({
     initialize,
     getState: () => publicState(),
     refresh,
+    setTestPremiumEnabled,
     createCheckoutUrl,
     createPortalUrl,
     hasFeature

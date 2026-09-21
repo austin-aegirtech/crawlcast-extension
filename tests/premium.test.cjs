@@ -52,6 +52,36 @@ test('unconfigured provider remains free and does not fake checkout', async () =
   await assert.rejects(service.createCheckoutUrl(), /not configured/i);
 });
 
+test('development Premium mode can simulate and persist an active entitlement', async () => {
+  const { service, storage } = createService({
+    config: { enablePremiumTestMode: true }
+  });
+
+  let state = await service.initialize();
+  assert.equal(state.testModeAvailable, true);
+  assert.equal(state.isPremium, false);
+
+  state = await service.setTestPremiumEnabled(true);
+  assert.equal(state.testModeEnabled, true);
+  assert.equal(state.isPremium, true);
+  assert.equal(state.features.unlimitedDownloads, true);
+  assert.equal(storage.premiumTestEnabled, true);
+
+  state = await service.setTestPremiumEnabled(false);
+  assert.equal(state.testModeEnabled, false);
+  assert.equal(state.isPremium, false);
+  assert.equal(storage.premiumTestEnabled, false);
+});
+
+test('production configuration rejects the Premium test override', async () => {
+  const { service } = createService();
+  await service.initialize();
+  await assert.rejects(
+    service.setTestPremiumEnabled(true),
+    /disabled in this build/i
+  );
+});
+
 test('active server entitlement unlocks unlimited downloads and is cached', async () => {
   const validUntil = Date.now() + 60 * 60 * 1000;
   const { service, storage } = createService({
