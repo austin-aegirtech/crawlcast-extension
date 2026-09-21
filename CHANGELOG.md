@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/austin-aegirtech/crawlcast-extension/compare/v0.3.0...v0.4.0) (2026-09-21)
+
+
+### Features
+
+* **backlight:** add backlight to elements active or in focus ([#29](https://github.com/austin-aegirtech/crawlcast-extension/issues/29)) ([ff29beb](https://github.com/austin-aegirtech/crawlcast-extension/commit/ff29beba9c24bcca0fa500dc5b2630246516f844))
+
 ## [0.3.0](https://github.com/austin-aegirtech/crawlcast-extension/compare/v0.2.1...v0.3.0) (2026-09-20)
 
 
