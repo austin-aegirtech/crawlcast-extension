@@ -42,7 +42,7 @@ class VideoDownloader {
     // Refuse in-browser downloads above this estimated size. Chunks plus the
     // final Blob roughly double the footprint, and a renderer that exceeds
     // its heap is killed silently — no error, no file, a stuck UI.
-    this.memoryLimitBytes = options.memoryLimitBytes || 1.5e9; // ~1.5 GB
+    this.memoryLimitBytes = options.memoryLimitBytes || 3.0e9; // ~3.0 GB
   }
 
   /**

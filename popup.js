@@ -1467,7 +1467,7 @@ function buildAudioFilename(title, audioFormat) {
 
 // In-browser downloads buffer everything in memory. Keep in sync with
 // VideoDownloader.memoryLimitBytes in downloader.js.
-const MEMORY_LIMIT_BYTES = 1.5e9;
+const MEMORY_LIMIT_BYTES = 3.0e9;
 
 /** Size / duration / quality line for a stream card */
 function renderSize(meta, format = 'm3u8') {
