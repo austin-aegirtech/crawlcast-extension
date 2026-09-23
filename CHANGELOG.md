@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.1](https://github.com/austin-aegirtech/crawlcast-extension/compare/v0.4.0...v0.4.1) (2026-09-23)
+
+
+### Bug Fixes
+
+* **memory:** change memory for downloads to 3gb ([9248dd8](https://github.com/austin-aegirtech/crawlcast-extension/commit/9248dd8a1f6280592f0a620c2606618ffd780e54))
+
 ## [0.4.0](https://github.com/austin-aegirtech/crawlcast-extension/compare/v0.3.0...v0.4.0) (2026-09-21)
 
 
