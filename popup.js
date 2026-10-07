@@ -70,25 +70,27 @@ function initAppHandlers() {
       setStatus(message.url, 'status-warn', '🔇 ' + message.message);
     }
     if (message.action === 'remuxStarted') {
-      setDownloadStage(message.url, 'Repairing MP4 file…', 100);
-      setStatus(message.url, 'status-success', message.merging
-        ? '🔊 Merging audio track and repairing MP4 file…'
-        : '🔧 Repairing MP4 file…');
+      const adding = [message.merging ? 'audio' : '', message.subtitling ? 'subtitles' : '']
+        .filter(Boolean).join(' and ');
+      setDownloadStage(message.url, 'Analyzing audio levels…', 100);
+      setStatus(message.url, 'status-success', adding
+        ? `🔧 Analyzing volume, adding ${adding}, and repairing MP4…`
+        : '🔊 Analyzing volume and repairing MP4…');
     }
     if (message.action === 'remuxComplete') {
       markDownloadComplete(message.url);
-      setStatus(message.url, 'status-success', message.alreadyOptimized
-        ? '✅ Complete — MP4 was already optimized'
-        : (message.merged
-          ? '✅ Complete — audio merged and MP4 repaired'
-          : '✅ Complete — MP4 saved and repaired'));
+      const completedWork = [];
+      if (message.normalized) completedWork.push('quiet audio normalized');
+      if (message.merged) completedWork.push('audio merged');
+      if (message.subtitled) completedWork.push('subtitles embedded');
+      if (!completedWork.length) completedWork.push('MP4 saved and repaired');
+      setStatus(message.url, 'status-success', `✅ Complete — ${completedWork.join(', ')}`);
     }
     if (message.action === 'remuxSkipped') {
       // Not an error: the file downloaded fine, it just wasn't defragmented
       markRepairSkipped(message.url);
       setStatus(message.url, 'status-warn',
-        '⚠️ Saved, but not repaired (ffmpeg/native host unavailable). ' +
-        'Playback may start slowly and seeking may be limited.');
+        `⚠️ ${message.message || 'Saved, but MP4 repair was unavailable.'}`);
     }
     if (message.action === 'audioExtractionStarted') {
       const label = String(message.format || '').toUpperCase();
@@ -98,12 +100,15 @@ function initAppHandlers() {
     if (message.action === 'audioDownloadComplete') {
       markAudioDownloadComplete(message.url);
       const label = String(message.format || '').toUpperCase();
+      const normalizedNote = message.normalized && Number.isFinite(message.inputLoudness)
+        ? ` — normalized from ${message.inputLoudness.toFixed(1)} to ${Number(message.targetLoudness).toFixed(1)} LUFS`
+        : '';
       setStatus(
         message.url,
         message.sourceRemoved === false ? 'status-warn' : 'status-success',
         message.sourceRemoved === false
           ? `⚠️ Saved ${message.filename || label + ' audio'}; temporary source file could not be removed.`
-          : `✅ Saved ${message.filename || label + ' audio'}`
+          : `✅ Saved ${message.filename || label + ' audio'}${normalizedNote}`
       );
     }
     if (message.action === 'audioDownloadError') {
@@ -115,6 +120,7 @@ function initAppHandlers() {
       const el = document.getElementById(`size-${hashCode(message.url)}`);
       if (el) el.innerHTML = renderSize(message.meta);
       updateDurationBadge(message.url, message.meta);
+      updateSubtitleBadge(message.url, message.meta);
     }
     if (message.action === 'thumbnailReady' && message.thumbnail) {
       // Swap the placeholder for the freshly generated thumbnail in place
@@ -508,6 +514,12 @@ function renderStreams(streams, tabId, pageTitle = currentPageTitle) {
     const duration = stream.meta?.durationSeconds
       ? formatDurationCompact(stream.meta.durationSeconds)
       : '';
+    const subtitleTracks = Array.isArray(stream.meta?.subtitleTracks)
+      ? stream.meta.subtitleTracks
+      : [];
+    const subtitleTitle = subtitleTracks.length
+      ? subtitleTracks.map((track) => track.name || track.language || 'Subtitles').join(', ')
+      : 'Subtitles available';
 
     if (stream.frames && stream.frames.length > 1) {
       thumbFrames.set(stream.url, stream.frames);
@@ -540,6 +552,12 @@ function renderStreams(streams, tabId, pageTitle = currentPageTitle) {
               <div class="badges">
                 <span class="format-badge">${formatLabel}</span>
                 ${requestType ? `<span class="request-badge">${escapeHtml(requestType)}</span>` : ''}
+                <span
+                  class="subtitle-badge"
+                  id="subtitle-${hash}"
+                  title="${escapeHtml(subtitleTitle)}"
+                  ${stream.meta?.hasSubtitles ? '' : 'hidden'}
+                >CC SUBS${subtitleTracks.length > 1 ? ` ×${subtitleTracks.length}` : ''}</span>
               </div>
               <div
                 class="stream-title ${isDownloading || isComplete ? 'title-locked' : ''}"
@@ -1396,6 +1414,18 @@ function updateDurationBadge(url, meta) {
   }
 }
 
+function updateSubtitleBadge(url, meta) {
+  const badge = document.getElementById(`subtitle-${hashCode(url)}`);
+  if (!badge) return;
+
+  const tracks = Array.isArray(meta?.subtitleTracks) ? meta.subtitleTracks : [];
+  badge.hidden = meta?.hasSubtitles !== true;
+  badge.textContent = `CC SUBS${tracks.length > 1 ? ` ×${tracks.length}` : ''}`;
+  badge.title = tracks.length
+    ? tracks.map((track) => track.name || track.language || 'Subtitles').join(', ')
+    : 'Subtitles available';
+}
+
 function getStreamTitle(stream, pageTitle) {
   const title = (stream?.title || pageTitle || '').trim();
   if (title) return title;
@@ -1439,6 +1469,17 @@ function buildDownloadFilename(title, format = 'm3u8') {
   const fallbackPrefix = format === 'pdf' ? 'document' : 'video';
   let base = (title || '').trim();
 
+  // Normalize punctuation before Windows sanitization. Some FFmpeg Windows
+  // builds reject smart quotes in output paths even though Explorer permits
+  // them, so use stable ASCII equivalents for every generated filename.
+  base = base
+    .normalize('NFKC')
+    .replace(/[\u2018\u2019\u201A\u201B]/g, "'")
+    .replace(/[\u201C\u201D\u201E\u201F]/g, '')
+    .replace(/[\u2013\u2014]/g, '-')
+    .replace(/\u2026/g, '...')
+    .replace(/\u00A0/g, ' ');
+
   // Avoid duplicate extensions when a title already ends in a supported file extension.
   base = base.replace(/\.(pdf|mp4|m4v|mov|mkv|webm)$/i, '');
 
@@ -1467,7 +1508,7 @@ function buildAudioFilename(title, audioFormat) {
 
 // In-browser downloads buffer everything in memory. Keep in sync with
 // VideoDownloader.memoryLimitBytes in downloader.js.
-const MEMORY_LIMIT_BYTES = 3.0e9;
+const MEMORY_LIMIT_BYTES = 1.5e9;
 
 /** Size / duration / quality line for a stream card */
 function renderSize(meta, format = 'm3u8') {

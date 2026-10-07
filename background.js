@@ -4,6 +4,7 @@ importScripts('premium-config.js', 'premium.js');
 // this worker only detects streams and brokers messages.
 // Store detected streams
 const detectedStreams = new Map();
+const detectedDirectAudio = new Map();
 const activeDownloads = new Map();
 
 // Blob URLs waiting for their chrome.downloads job to finish (downloadId -> blobUrl).
@@ -312,13 +313,8 @@ async function remuxDownloadedFile(downloadId, streamUrl) {
   // ffmpeg combines both tracks and writes a proper index in one pass.
   const audio = pendingAudioMerge.get(streamUrl);
   pendingAudioMerge.delete(streamUrl);
-
-  // Direct MP4s are often already normal, faststart files. Inspect those
-  // first so a healthy file can finish immediately without an unnecessary
-  // full-file rewrite. HLS output still always gets remuxed because the
-  // browser pipeline emits fragmented MP4.
-  const stream = detectedStreams.get(streamUrl);
-  const inspectFirst = getStreamFormat(stream || streamUrl) === 'mp4' && !audio;
+  const subtitle = pendingSubtitleMerge.get(streamUrl);
+  pendingSubtitleMerge.delete(streamUrl);
 
   let port;
   try {
@@ -334,6 +330,13 @@ async function remuxDownloadedFile(downloadId, streamUrl) {
                  '-c copy output.mp4'
       });
     }
+    if (subtitle) {
+      broadcast({
+        action: 'remuxSkipped',
+        url: streamUrl,
+        message: 'Subtitle track was detected but could not be embedded because the native host is unavailable.'
+      });
+    }
     return;
   }
 
@@ -346,9 +349,11 @@ async function remuxDownloadedFile(downloadId, streamUrl) {
     broadcast({
       action: 'remuxStarted',
       url: streamUrl,
-      merging: !!(audio && audio.audioPath)
+      merging: !!(audio && audio.audioPath),
+      subtitling: !!subtitle,
+      analyzingAudio: true
     });
-    port.postMessage(buildRemuxMessage(item.filename, audio));
+    port.postMessage(buildRemuxMessage(item.filename, audio, subtitle));
   };
 
   port.onMessage.addListener((msg) => {
@@ -376,6 +381,10 @@ async function remuxDownloadedFile(downloadId, streamUrl) {
         url: streamUrl,
         path: msg.path,
         merged: !!msg.merged,
+        subtitled: !!msg.subtitled,
+        normalized: !!msg.normalized,
+        inputLoudness: msg.inputLoudness,
+        targetLoudness: msg.targetLoudness,
         alreadyOptimized: false
       });
       port.disconnect();
@@ -395,11 +404,7 @@ async function remuxDownloadedFile(downloadId, streamUrl) {
     }
   });
 
-  if (inspectFirst) {
-    port.postMessage({ action: 'inspect', path: item.filename });
-  } else {
-    startRemux();
-  }
+  startRemux();
 }
 
 function failAudioExtraction(streamUrl, message) {
@@ -464,7 +469,10 @@ async function extractAudioDownloadedFile(downloadId, streamUrl, audioFormat, ou
             filename,
             path: msg.path,
             transcoded: !!msg.transcoded,
-            sourceRemoved: msg.sourceRemoved !== false
+            sourceRemoved: msg.sourceRemoved !== false,
+            normalized: !!msg.normalized,
+            inputLoudness: msg.inputLoudness,
+            targetLoudness: msg.targetLoudness
           });
           maybeCloseOffscreen();
           resolve();
@@ -502,6 +510,8 @@ const STALE_DOWNLOAD_MS = 2 * 60 * 1000;
 // files are merged by ffmpeg once both are on disk.
 // streamUrl -> { audioPath, audioDownloadId, trackName }
 const pendingAudioMerge = new Map();
+// streamUrl -> { url, name, language }
+const pendingSubtitleMerge = new Map();
 
 // ---------------------------------------------------------------------------
 // Diagnostics log
@@ -569,8 +579,18 @@ const streamsRestored = chrome.storage.session.get('detectedStreams').then((data
   persistStreams();
 });
 
+const directAudioRestored = chrome.storage.session.get('detectedDirectAudio').then((data) => {
+  for (const [url, info] of (data.detectedDirectAudio || [])) {
+    if (!detectedDirectAudio.has(url)) detectedDirectAudio.set(url, info);
+  }
+});
+
 function persistStreams() {
   chrome.storage.session.set({ detectedStreams: Array.from(detectedStreams.entries()) });
+}
+
+function persistDirectAudio() {
+  chrome.storage.session.set({ detectedDirectAudio: Array.from(detectedDirectAudio.entries()) });
 }
 
 // Direct media formats Crawlcast can download. HLS keeps its existing
@@ -588,6 +608,37 @@ function getStreamFormat(streamOrUrl) {
   if (MP4_PATTERN.test(url)) return 'mp4';
   if (M3U8_PATTERN.test(url)) return 'm3u8';
   return null;
+}
+
+function findRelatedHlsMaster(stream) {
+  if (!stream || getStreamFormat(stream) !== 'm3u8') return null;
+
+  let selected;
+  try {
+    selected = new URL(stream.url);
+  } catch {
+    return null;
+  }
+  if (/(?:^|\/)master(?:[^/]*)\.m3u8$/i.test(selected.pathname)) return stream;
+
+  const candidates = Array.from(detectedStreams.values())
+    .filter((candidate) => candidate.tabId === stream.tabId)
+    .filter((candidate) => getStreamFormat(candidate) === 'm3u8')
+    .filter((candidate) => candidate.initiator === stream.initiator)
+    .filter((candidate) => {
+      try {
+        const parsed = new URL(candidate.url);
+        if (parsed.origin !== selected.origin) return false;
+        if (!/(?:^|\/)master(?:[^/]*)\.m3u8$/i.test(parsed.pathname)) return false;
+        const parentPath = parsed.pathname.slice(0, parsed.pathname.lastIndexOf('/') + 1);
+        return selected.pathname.startsWith(parentPath);
+      } catch {
+        return false;
+      }
+    })
+    .sort((a, b) => b.timestamp - a.timestamp);
+
+  return candidates[0] || null;
 }
 
 function addDetectedItem({ url, timestamp, tabId, type, initiator, format, title }) {
@@ -627,10 +678,129 @@ function addDetectedItem({ url, timestamp, tabId, type, initiator, format, title
   return true;
 }
 
+function getMediaIdentity(url) {
+  try {
+    const parsed = new URL(url);
+    for (const key of ['id', 'video_id', 'media_id', 'asset_id']) {
+      const value = parsed.searchParams.get(key);
+      if (value) return `${key}:${value}`;
+    }
+  } catch {
+    // Invalid URLs are rejected before they reach this helper.
+  }
+  return '';
+}
+
+function getMediaMimeFromUrl(url) {
+  try {
+    const mime = new URL(url).searchParams.get('mime') || '';
+    const match = mime.match(/^(audio\/(?:mp4|webm|mpeg|mp3|aac))(?:\s*;|$)/i);
+    return match ? match[1].toLowerCase() : '';
+  } catch {
+    return '';
+  }
+}
+
+function normalizeDirectAudioUrl(url) {
+  const parsed = new URL(url);
+
+  // YouTube requests the same adaptive track in byte-range chunks. Those
+  // transient parameters create dozens of candidates and would download only
+  // one chunk if reused through chrome.downloads. Removing them requests the
+  // complete signed audio resource while retaining its authorization fields.
+  if (/(^|\.)googlevideo\.com$/i.test(parsed.hostname)) {
+    for (const key of ['range', 'rn', 'rbuf']) parsed.searchParams.delete(key);
+  }
+
+  return parsed.href;
+}
+
+function getHostFamily(url) {
+  try {
+    const labels = new URL(url).hostname.split('.').filter(Boolean);
+    return labels.slice(-2).join('.');
+  } catch {
+    return '';
+  }
+}
+
+function getAudioSourceExtension(contentType) {
+  if (/audio\/webm/i.test(contentType)) return 'webm';
+  if (/audio\/(?:mpeg|mp3)/i.test(contentType)) return 'mp3';
+  if (/audio\/aac/i.test(contentType)) return 'aac';
+  return 'm4a';
+}
+
+function addDetectedDirectAudio(details, contentType) {
+  let normalizedUrl;
+  try {
+    const parsed = new URL(details.url);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
+    normalizedUrl = normalizeDirectAudioUrl(parsed.href);
+  } catch {
+    return false;
+  }
+
+  detectedDirectAudio.set(normalizedUrl, {
+    url: normalizedUrl,
+    timestamp: Date.now(),
+    tabId: details.tabId,
+    type: details.type,
+    initiator: details.initiator || 'unknown',
+    contentType,
+    extension: getAudioSourceExtension(contentType),
+    mediaIdentity: getMediaIdentity(normalizedUrl),
+    hostFamily: getHostFamily(normalizedUrl)
+  });
+
+  // A URL ending in .mp4 may have been tentatively classified before its
+  // response headers proved it was audio-only. Do not show it as a video card.
+  const removedVideoCard = detectedStreams.delete(normalizedUrl);
+  if (removedVideoCard) persistStreams();
+
+  while (detectedDirectAudio.size > 50) {
+    detectedDirectAudio.delete(detectedDirectAudio.keys().next().value);
+  }
+  persistDirectAudio();
+  return true;
+}
+
+function findDirectAudioSource(stream) {
+  if (!stream || !Number.isInteger(stream.tabId)) return null;
+  const now = Date.now();
+  const identity = getMediaIdentity(stream.url);
+  const hostFamily = getHostFamily(stream.url);
+  const candidates = Array.from(detectedDirectAudio.values())
+    .filter((candidate) => candidate.tabId === stream.tabId)
+    .filter((candidate) => now - candidate.timestamp < 5 * 60 * 1000)
+    .sort((a, b) => b.timestamp - a.timestamp);
+
+  if (identity) {
+    const exact = candidates.find((candidate) => candidate.mediaIdentity === identity);
+    if (exact) return exact;
+  }
+
+  const contextual = candidates.filter((candidate) =>
+    candidate.hostFamily === hostFamily &&
+    candidate.initiator === stream.initiator
+  );
+  if (contextual.length > 0) return contextual[0];
+
+  const sameHost = candidates.filter((candidate) => candidate.hostFamily === hostFamily);
+  return sameHost[0] || null;
+}
+
 // Listen for network requests
 chrome.webRequest.onBeforeRequest.addListener(
   (details) => {
     const url = details.url;
+    const audioMime = getMediaMimeFromUrl(url);
+    if (audioMime) {
+      addDetectedDirectAudio(details, audioMime);
+      console.log('[AUDIO Detector] Found direct audio companion by URL:', url);
+      return;
+    }
+
     const format = getStreamFormat(url);
 
     if (!format) return;
@@ -676,6 +846,17 @@ function getResponseTotalBytes(details) {
 chrome.webRequest.onHeadersReceived.addListener(
   (details) => {
     const contentType = getResponseHeader(details.responseHeaders, 'content-type');
+    const queryMime = getMediaMimeFromUrl(details.url);
+    const audioContentType = /^audio\/(?:mp4|webm|mpeg|mp3|aac)(?:\s*;|$)/i.test(contentType)
+      ? contentType
+      : queryMime;
+    if (audioContentType) {
+      addDetectedDirectAudio(details, audioContentType);
+      console.log('[AUDIO Detector] Found direct audio companion:', details.url);
+      updateBadge(details.tabId);
+      return;
+    }
+
     const format = /^application\/pdf(?:\s*;|$)/i.test(contentType)
       ? 'pdf'
       : (/^video\/mp4(?:\s*;|$)/i.test(contentType) || getStreamFormat(details.url) === 'mp4'
@@ -929,7 +1110,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   // Clear streams
   if (request.action === 'clearStreams') {
     console.log('clear streams');
-    streamsRestored.then(() => {
+    Promise.all([streamsRestored, directAudioRestored]).then(() => {
       for (const [url, stream] of detectedStreams) {
         if (stream.tabId !== request.tabId) continue;
 
@@ -945,9 +1126,15 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           activeDownloads.delete(url);
           broadcast({ action: 'downloadError', url, error: 'Download stalled — cleared' });
         }
+        pendingAudioMerge.delete(url);
+        pendingSubtitleMerge.delete(url);
         detectedStreams.delete(url);
       }
+      for (const [url, source] of detectedDirectAudio) {
+        if (source.tabId === request.tabId) detectedDirectAudio.delete(url);
+      }
       persistStreams();
+      persistDirectAudio();
       persistActiveHlsDownloadsNow();
       maybeCloseOffscreen();
 
@@ -1016,6 +1203,14 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   // Offscreen finished: save the blob via the downloads API
   // (offscreen documents can't call chrome.downloads themselves)
   if (request.action === 'saveBlob') {
+    if (!request.audioFormat && request.subtitleUrl) {
+      pendingSubtitleMerge.set(request.streamUrl, {
+        url: request.subtitleUrl,
+        name: request.subtitleTrackName || 'Subtitles',
+        language: request.subtitleLanguage || null
+      });
+    }
+
     // Separate audio rendition: save the audio file first so both paths
     // exist on disk when the merge runs
     if (request.needsAudioMerge && request.audioBlobUrl) {
@@ -1146,9 +1341,23 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       }
       targets.forEach((url) => thumbnailJobs.add(url));
       await ensureOffscreenDocument();
-      for (const url of targets) {
-        chrome.runtime.sendMessage({ target: 'offscreen', action: 'generateThumbnail', url })
-          .catch(() => { thumbnailJobs.delete(url); });
+      const analysisGroups = new Map();
+      for (const streamUrl of targets) {
+        const stream = detectedStreams.get(streamUrl);
+        const master = findRelatedHlsMaster(stream);
+        const analysisUrl = master?.url || streamUrl;
+        if (!analysisGroups.has(analysisUrl)) analysisGroups.set(analysisUrl, []);
+        analysisGroups.get(analysisUrl).push(streamUrl);
+      }
+      for (const [analysisUrl, streamUrls] of analysisGroups) {
+        chrome.runtime.sendMessage({
+          target: 'offscreen',
+          action: 'generateThumbnail',
+          url: analysisUrl,
+          streamUrls
+        }).catch(() => {
+          streamUrls.forEach((streamUrl) => thumbnailJobs.delete(streamUrl));
+        });
       }
       sendResponse({ started: targets.length });
     });
@@ -1262,6 +1471,8 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.action === 'cancelDownload') {
     const active = activeDownloads.get(request.url);
     activeDownloads.delete(request.url);
+    pendingAudioMerge.delete(request.url);
+    pendingSubtitleMerge.delete(request.url);
     if (active?.kind === 'hls') persistActiveHlsDownloadsNow();
 
     if (active?.kind === 'direct' && Number.isInteger(active.downloadId)) {
@@ -1290,11 +1501,18 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
 const NATIVE_HOST = 'com.crawlcast.downloader';
 
-/** Path the native host should be asked to operate on, plus the audio to merge */
-function buildRemuxMessage(videoPath, audio) {
-  return (audio && audio.audioPath)
-    ? { action: 'remux', path: videoPath, audioPath: audio.audioPath }
-    : { action: 'remux', path: videoPath };
+/** Paths/URLs the native host should combine into the final MP4. */
+function buildRemuxMessage(videoPath, audio, subtitle) {
+  return {
+    action: 'remux',
+    path: videoPath,
+    ...(audio?.audioPath ? { audioPath: audio.audioPath } : {}),
+    ...(subtitle?.url ? {
+      subtitleUrl: subtitle.url,
+      subtitleName: subtitle.name || null,
+      subtitleLanguage: subtitle.language || null
+    } : {})
+  };
 }
 
 function broadcast(message) {
@@ -1307,7 +1525,7 @@ function broadcast(message) {
  * handed to the browser downloads API. Only MP4 is inspected/remuxed.
  */
 async function startDownload(url, filename, tabId, requestedAudioFormat = null) {
-  await Promise.all([directDownloadsRestored, hlsDownloadsRestored]);
+  await Promise.all([directDownloadsRestored, hlsDownloadsRestored, directAudioRestored]);
   const stream = detectedStreams.get(url);
   const format = getStreamFormat(stream || url);
   const audioFormat = requestedAudioFormat === 'mp3'
@@ -1324,6 +1542,25 @@ async function startDownload(url, filename, tabId, requestedAudioFormat = null) 
 
   if (format === 'mp4' || format === 'pdf') {
     const fallbackName = format === 'pdf' ? 'document.pdf' : 'video.mp4';
+    if (audioFormat && format === 'mp4') {
+      const directAudio = findDirectAudioSource(stream);
+      if (directAudio) {
+        console.log('[Audio] Using detected direct audio companion:', directAudio.url);
+        return startDirectDownload(
+          directAudio.url,
+          buildAudioSourceFilename(outputFilename, directAudio.extension),
+          'audio',
+          {
+            audioFormat,
+            audioOutputFilename: outputFilename,
+            streamUrl: url
+          }
+        );
+      }
+      throw new Error(
+        'No matching audio stream was detected. Reload the page, play the video for several seconds, then try again.'
+      );
+    }
     return startDirectDownload(url, audioFormat ? sourceFilename : (filename || fallbackName), format, {
       audioFormat,
       audioOutputFilename: audioFormat ? outputFilename : null
@@ -1331,6 +1568,12 @@ async function startDownload(url, filename, tabId, requestedAudioFormat = null) 
   }
 
   if (format !== 'm3u8') throw new Error('Unsupported download format');
+
+  const masterStream = findRelatedHlsMaster(stream);
+  const sourceUrl = masterStream?.url || url;
+  if (sourceUrl !== url) {
+    console.log('[HLS] Using related master playlist for audio/subtitle discovery:', sourceUrl);
+  }
 
   // Register before the await so maybeCloseOffscreen() can't close
   // the document out from under a download that's about to start
@@ -1349,7 +1592,8 @@ async function startDownload(url, filename, tabId, requestedAudioFormat = null) 
   chrome.runtime.sendMessage({
     target: 'offscreen',
     action: 'downloadStream',
-    url: url,
+    url: sourceUrl,
+    streamUrl: url,
     filename: audioFormat ? sourceFilename : (filename || 'video.mp4'),
     audioFormat,
     audioOutputFilename: audioFormat ? outputFilename : null
@@ -1364,7 +1608,8 @@ function buildAudioSourceFilename(outputFilename, extension) {
 }
 
 async function startDirectDownload(url, filename, format, options = {}) {
-  activeDownloads.set(url, {
+  const streamUrl = options.streamUrl || url;
+  activeDownloads.set(streamUrl, {
     kind: 'direct',
     paused: false,
     progress: {
@@ -1384,7 +1629,7 @@ async function startDirectDownload(url, filename, format, options = {}) {
   try {
     const downloadId = await chrome.downloads.download({ url, filename });
     const entry = {
-      streamUrl: url,
+      streamUrl,
       filename,
       format,
       audioFormat: options.audioFormat || null,
@@ -1397,7 +1642,7 @@ async function startDirectDownload(url, filename, format, options = {}) {
     directDownloads.set(downloadId, entry);
     persistDirectDownloads();
 
-    const active = activeDownloads.get(url);
+    const active = activeDownloads.get(streamUrl);
     if (active) active.downloadId = downloadId;
 
     // Pick up initial size/state immediately. Very small files may finish
@@ -1427,7 +1672,7 @@ async function startDirectDownload(url, filename, format, options = {}) {
 
     return downloadId;
   } catch (error) {
-    activeDownloads.delete(url);
+    activeDownloads.delete(streamUrl);
     throw error;
   }
 }

@@ -25,6 +25,19 @@ test('both direct MP4 and HLS paths retain audio extraction settings', () => {
   assert.match(offscreen, /audioOnlyBlob = audioFormat && result\.audioBlob/);
 });
 
+test('direct adaptive video can use a detected companion audio response', () => {
+  const background = read('background.js');
+  assert.match(background, /const detectedDirectAudio = new Map\(\);/);
+  assert.match(background, /function getMediaMimeFromUrl\(url\)/);
+  assert.match(background, /Found direct audio companion by URL/);
+  assert.match(background, /for \(const key of \['range', 'rn', 'rbuf'\]\)/);
+  assert.match(background, /audioContentType[\s\S]*addDetectedDirectAudio\(details, audioContentType\)/);
+  assert.match(background, /function findDirectAudioSource\(stream\)/);
+  assert.match(background, /const directAudio = findDirectAudioSource\(stream\);/);
+  assert.match(background, /directAudio\.url[\s\S]*streamUrl: url/);
+  assert.match(background, /No matching audio stream was detected/);
+});
+
 test('native host exposes M4A and MP3 extraction', () => {
   const host = read('native-host/crawlcast_host.py');
   assert.match(host, /def run_extract_audio\(path, output_name, audio_format\):/);
@@ -32,4 +45,5 @@ test('native host exposes M4A and MP3 extraction', () => {
   assert.match(host, /"-c:a", "copy"/);
   assert.match(host, /"-c:a", "libmp3lame", "-b:a", "320k"/);
   assert.match(host, /action == "extractAudio"/);
+  assert.match(host, /No audio track was found in the downloaded source/);
 });

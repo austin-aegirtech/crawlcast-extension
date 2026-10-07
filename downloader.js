@@ -42,7 +42,7 @@ class VideoDownloader {
     // Refuse in-browser downloads above this estimated size. Chunks plus the
     // final Blob roughly double the footprint, and a renderer that exceeds
     // its heap is killed silently — no error, no file, a stuck UI.
-    this.memoryLimitBytes = options.memoryLimitBytes || 3.0e9; // ~3.0 GB
+    this.memoryLimitBytes = options.memoryLimitBytes || 1.5e9; // ~1.5 GB
   }
 
   /**
@@ -59,6 +59,7 @@ class VideoDownloader {
       let mediaPlaylist = playlist;
       let bandwidth = null;
       let audioRendition = null;
+      let subtitleRendition = null;
       if (playlist.isMaster) {
         const bestVariant = this.parser.selectBestVariant(playlist.variants);
         bandwidth = bestVariant.bandwidth;
@@ -69,6 +70,7 @@ class VideoDownloader {
         // video-only. Downloading just those yields a silent file — the
         // audio rendition has to be fetched and merged separately.
         audioRendition = this.parser.selectAudioRendition(playlist, bestVariant);
+        subtitleRendition = this.parser.selectSubtitleRendition(playlist, bestVariant);
 
         // Log the decision either way — a silent download is almost always
         // explained by one of these branches
@@ -91,11 +93,29 @@ class VideoDownloader {
                       `(master declares ${playlist.media.length} EXT-X-MEDIA tag(s))`);
         }
 
+        const subtitleTracks = playlist.media.filter(m => m.type === 'SUBTITLES');
+        if (subtitleRendition) {
+          console.log('[Subtitles] Track selected:',
+                      subtitleRendition.name || subtitleRendition.language || 'default',
+                      subtitleRendition.url);
+        } else if (bestVariant.subtitlesGroup && subtitleTracks.length) {
+          console.warn(`[Subtitles] Variant references SUBTITLES group "${bestVariant.subtitlesGroup}" ` +
+                       `but no matching rendition has a URI.`);
+        } else if (bestVariant.subtitlesGroup) {
+          console.warn(`[Subtitles] Variant references SUBTITLES group "${bestVariant.subtitlesGroup}" ` +
+                       `but the master declares no subtitle tracks.`);
+        } else {
+          console.log(`[Subtitles] No subtitle group on the selected variant ` +
+                      `(${subtitleTracks.length} subtitle track(s) declared by master).`);
+        }
+
         mediaPlaylist = await this.fetchPlaylist(bestVariant.url);
       } else {
         console.warn('[Audio] This is a MEDIA playlist, not a master. Separate audio ' +
                      'renditions are only declared in the master playlist, so none can ' +
                      'be detected. If the result is silent, download the master instead.');
+        console.warn('[Subtitles] This is a MEDIA playlist, not a master. Subtitle ' +
+                     'renditions cannot be discovered from this URL.');
       }
 
       // Step 2b: Guard against downloads too large to hold in memory.
@@ -170,7 +190,12 @@ class VideoDownloader {
         audioTrackName: audioRendition
           ? (audioRendition.name || audioRendition.language || 'audio')
           : null,
-        audioMissing: !!audioRendition && !audioBlob
+        audioMissing: !!audioRendition && !audioBlob,
+        subtitleUrl: subtitleRendition?.url || null,
+        subtitleTrackName: subtitleRendition
+          ? (subtitleRendition.name || subtitleRendition.language || 'Subtitles')
+          : null,
+        subtitleLanguage: subtitleRendition?.language || null
       });
       
     } catch (error) {
