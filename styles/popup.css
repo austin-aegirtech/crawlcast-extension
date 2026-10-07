@@ -541,7 +541,8 @@ video.direct-mp4-preview {
 }
 
 .format-badge,
-.request-badge {
+.request-badge,
+.subtitle-badge {
   padding: 2px 5px;
   border-radius: 4px;
   border: 1px solid #56606a;
@@ -556,6 +557,13 @@ video.direct-mp4-preview {
 .request-badge {
   border-color: #485048;
   color: #99ad99;
+}
+
+.subtitle-badge {
+  border-color: #6f5cff;
+  color: #d7d0ff;
+  background: rgba(111, 92, 255, 0.16);
+  box-shadow: 0 0 10px rgba(111, 92, 255, 0.28);
 }
 
 .stream-title {

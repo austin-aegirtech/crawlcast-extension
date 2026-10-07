@@ -147,7 +147,8 @@ class M3U8Parser {
       codecs: a.CODECS || null,
       frameRate: a['FRAME-RATE'] ? parseFloat(a['FRAME-RATE']) : null,
       // Group IDs linking this variant to EXT-X-MEDIA renditions
-      audioGroup: a.AUDIO || null
+      audioGroup: a.AUDIO || null,
+      subtitlesGroup: a.SUBTITLES || null
     };
   }
 
@@ -182,6 +183,20 @@ class M3U8Parser {
     return candidates.find(m => m.isDefault)
         || candidates.sort((a, b) =>
              (parseInt(b.channels, 10) || 0) - (parseInt(a.channels, 10) || 0))[0];
+  }
+
+  /** Select the default WebVTT subtitle rendition for a variant. */
+  selectSubtitleRendition(playlist, variant) {
+    if (!variant || !variant.subtitlesGroup) return null;
+
+    const candidates = playlist.media.filter(
+      m => m.type === 'SUBTITLES' && m.groupId === variant.subtitlesGroup && m.url
+    );
+    if (!candidates.length) return null;
+
+    return candidates.find(m => m.isDefault)
+        || candidates.find(m => m.autoselect)
+        || candidates[0];
   }
 
   /**

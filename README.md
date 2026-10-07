@@ -28,7 +28,7 @@ Crawlcast handles both paths:
 - **Direct MP4** — detected and handed directly to the browser download manager.
 - **HLS / M3U8** — playlist parsed, segments downloaded, media assembled, then saved as MP4.
 
-When the optional native host is installed, Crawlcast can also inspect the finished MP4 and repair its container structure with FFmpeg when necessary. Already-optimized direct MP4 files can skip the rewrite entirely.
+When the optional native host is installed, Crawlcast repairs the finished MP4 and automatically raises quiet audio toward `-16 LUFS` while limiting true peak to `-1.5 dBTP`. Video is copied without re-encoding.
 
 > [!IMPORTANT]
 > Crawlcast is a media transport and file-processing tool. Only download media that you own or are authorized to save. Website terms, copyright rules, authentication boundaries, DRM, and access restrictions still apply.
@@ -73,6 +73,8 @@ When the optional native host is installed, Crawlcast can also inspect the finis
 - Lossless FFmpeg stream-copy repair
 - `+faststart` MP4 finalization
 - Duration verification with FFprobe
+- Automatic quiet-audio normalization using two-pass EBU R128 analysis
+- Recursive media inspection through `npm run analyze:media`
 
 </td>
 </tr>
@@ -254,17 +256,17 @@ The in-browser HLS pipeline produces fragmented MP4 output. Some players can ope
 - playback startup;
 - compatibility with other tools.
 
-Direct MP4 files are different: many are already properly indexed and optimized. Crawlcast therefore avoids rewriting a healthy direct MP4 when it can.
+Direct MP4 files are also passed through the native host so their audio can be analyzed before completion.
 
 ### Current repair behavior
 
 For **direct MP4** downloads, the native host:
 
-1. inspects MP4 box headers;
-2. checks for fragmentation (`moof`);
-3. verifies that `moov` metadata exists and is positioned before media data;
-4. skips FFmpeg when the file is already optimized;
-5. otherwise repairs it with a stream-copy remux.
+1. analyzes the first audio track using FFmpeg `loudnorm`;
+2. boosts audio only when it is more than `0.5 LU` below `-16 LUFS`;
+3. limits normalized output to `-1.5 dBTP`;
+4. copies the video stream without re-encoding;
+5. repairs the MP4 and moves `moov` metadata to the front.
 
 For **HLS-generated MP4** files, Crawlcast performs the final stream-copy repair because the browser pipeline intentionally produces fragmented MP4 output.
 
@@ -274,7 +276,7 @@ The repair command is designed around the equivalent of:
 ffmpeg -i input.mp4 -c copy -movflags +faststart output.mp4
 ```
 
-No normal video/audio re-encoding is performed during this repair, so it is primarily limited by disk I/O rather than codec speed.
+Video is never re-encoded. Audio is copied unchanged when it is already loud enough; quiet audio is re-encoded to AAC at `256 kb/s` while normalization is applied.
 
 If an HLS master supplied a separate audio rendition, the native host can merge that audio with the downloaded video during the same FFmpeg stream-copy pass.
 
@@ -325,6 +327,45 @@ Then fully restart Chrome.
 
 Crawlcast intentionally keeps the browser extension side lightweight: vanilla JavaScript, browser APIs, and checked-in runtime dependencies.
 
+### Analyze local media
+
+Scan one file or every supported media file below a directory:
+
+```bash
+npm run analyze:media -- "/path/to/video.mp4"
+npm run analyze:media -- "/path/to/video-folder"
+```
+
+Use `--json` for machine-readable output or `--fast` to skip the full-file loudness pass:
+
+```bash
+npm run analyze:media -- "/path/to/video-folder" --json
+npm run analyze:media -- "/path/to/video-folder" --fast
+```
+
+The report includes FFprobe container and stream data, codecs, resolution, frame rate, duration, bitrate, audio channels, EBU R128 loudness, true peak, loudness range, subtitle tracks, chapters, metadata tags, and MP4 atom/fragmentation/fast-start state.
+
+### Fix quiet audio in existing files
+
+Measure a file or folder and normalize only files below `-16.5 LUFS`:
+
+```bash
+npm run fix:audio -- "/path/to/video.mp4"
+npm run fix:audio -- "/path/to/video-folder"
+```
+
+By default, the original is preserved and a `.normalized` copy is created. Use
+`--in-place` to replace the original only after FFmpeg successfully creates a
+valid output. Use `--force` to normalize a file that is already within target.
+
+```bash
+npm run fix:audio -- "/path/to/video.mp4" --in-place
+```
+
+Crawlcast performs the same two-pass loudness check automatically after every
+completed MP4 download when the native host is installed. Quiet audio is
+normalized to `-16 LUFS`; video is always stream-copied without re-encoding.
+
 ### Repository layout
 
 ```text
@@ -350,6 +391,7 @@ crawlcast-extension/
 │   ├── com.crawlcast.downloader.json
 │   └── register-native-host*.{ps1,sh}
 └── tools/
+    ├── analyze-media.cjs         # Recursive FFprobe/FFmpeg media analyzer
     ├── remux.sh                  # Standalone remux helper
     └── Repair-Videos.ps1         # Windows video repair/scan helper
 ```

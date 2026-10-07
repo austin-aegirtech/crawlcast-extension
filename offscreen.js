@@ -42,7 +42,8 @@ chrome.runtime.onMessage.addListener((request) => {
       request.url,
       request.filename,
       request.audioFormat,
-      request.audioOutputFilename
+      request.audioOutputFilename,
+      request.streamUrl || request.url
     );
   }
 
@@ -81,19 +82,26 @@ chrome.runtime.onMessage.addListener((request) => {
 
   // Generate a thumbnail for a detected stream (lazy, requested via popup)
   if (request.action === 'generateThumbnail') {
-    generateThumbnail(request.url)
+    const streamUrls = Array.isArray(request.streamUrls) && request.streamUrls.length
+      ? request.streamUrls
+      : [request.url];
+    generateThumbnail(request.url, streamUrls)
       .then((frames) => {
-        chrome.runtime.sendMessage({
-          action: 'thumbnailReady',
-          url: request.url,
-          thumbnail: frames[0],
-          frames: frames
-        }).catch(() => {});
+        for (const streamUrl of streamUrls) {
+          chrome.runtime.sendMessage({
+            action: 'thumbnailReady',
+            url: streamUrl,
+            thumbnail: frames[0],
+            frames: frames
+          }).catch(() => {});
+        }
       })
       .catch((err) => {
         console.warn('[Thumbnail] Failed for', request.url, err);
-        chrome.runtime.sendMessage({ action: 'thumbnailReady', url: request.url, thumbnail: null })
-          .catch(() => {});
+        for (const streamUrl of streamUrls) {
+          chrome.runtime.sendMessage({ action: 'thumbnailReady', url: streamUrl, thumbnail: null })
+            .catch(() => {});
+        }
       });
   }
 });
@@ -106,12 +114,26 @@ chrome.runtime.onMessage.addListener((request) => {
  * few seconds.
  * @returns {Promise<string[]>} JPEG data URLs (frame 0 = static thumbnail)
  */
-async function generateThumbnail(url) {
+async function generateThumbnail(url, streamUrls = [url]) {
   const parser = new M3U8Parser();
 
   const resp = await fetch(url);
   if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
   let playlist = parser.parse(await resp.text(), url);
+  const subtitleTracks = playlist.isMaster
+    ? playlist.media
+        .filter((track) => track.type === 'SUBTITLES' && track.url)
+        .map((track) => ({
+          name: track.name || null,
+          language: track.language || null,
+          isDefault: !!track.isDefault,
+          autoselect: !!track.autoselect
+        }))
+    : [];
+  if (subtitleTracks.length > 0) {
+    console.log(`[Subtitles] ${subtitleTracks.length} track(s) available during scan:`,
+                subtitleTracks.map((track) => track.name || track.language || 'Subtitles').join(', '));
+  }
 
   // The download always takes the HIGHEST bandwidth variant, so size must be
   // estimated from that one — even though frames are sampled from the lowest.
@@ -150,9 +172,11 @@ async function generateThumbnail(url) {
     bytes: downloadVariant && durationSeconds
       ? Math.round((downloadVariant.bandwidth / 8) * durationSeconds)
       : null,
-    estimated: true
+    estimated: true,
+    hasSubtitles: subtitleTracks.length > 0,
+    subtitleTracks
   };
-  if (meta.bytes) sendMeta(url, meta);
+  if (meta.bytes) streamUrls.forEach((streamUrl) => sendMeta(streamUrl, meta));
 
   // Up to 8 segment indices evenly spread from start to end of the video
   const frameCount = Math.min(8, segments.length);
@@ -179,7 +203,7 @@ async function generateThumbnail(url) {
   // from the segments we just downloaded anyway.
   if (!meta.bytes && sampledCount > 0) {
     meta.bytes = Math.round((sampledBytes / sampledCount) * segments.length);
-    sendMeta(url, meta);
+    streamUrls.forEach((streamUrl) => sendMeta(streamUrl, meta));
   }
 
   if (frames.length === 0) throw new Error('No frames captured');
@@ -304,23 +328,23 @@ function captureFrames(src, frameCount = 8) {
 // Live VideoDownloader instances, so cancel requests can reach them
 const runningDownloads = new Map();
 
-function startDownload(url, filename, audioFormat = null, audioOutputFilename = null) {
+function startDownload(url, filename, audioFormat = null, audioOutputFilename = null, streamUrl = url) {
   const downloader = new VideoDownloader({
     onProgress: (progress) => {
       chrome.runtime.sendMessage({
         action: 'downloadProgress',
-        url: url,
+        url: streamUrl,
         progress: progress
       }).catch(() => {}); // Ignore if popup closed
     },
 
     onComplete: (result) => {
-      runningDownloads.delete(url);
+      runningDownloads.delete(streamUrl);
 
       if (audioFormat && result.audioMissing) {
         chrome.runtime.sendMessage({
           action: 'downloadError',
-          url,
+          url: streamUrl,
           error: 'The separate HLS audio track could not be downloaded'
         }).catch(() => {});
         return;
@@ -349,28 +373,31 @@ function startDownload(url, filename, audioFormat = null, audioOutputFilename = 
         action: 'saveBlob',
         blobUrl: blobUrl,
         filename: sourceFilename,
-        streamUrl: url,
+        streamUrl,
         audioFormat: audioFormat || null,
         audioOutputFilename: audioOutputFilename || null,
         audioBlobUrl,
         audioFilename,
         needsAudioMerge: !!result.needsAudioMerge,
         audioTrackName: result.audioTrackName,
-        audioMissing: !!result.audioMissing
+        audioMissing: !!result.audioMissing,
+        subtitleUrl: audioFormat ? null : result.subtitleUrl,
+        subtitleTrackName: result.subtitleTrackName,
+        subtitleLanguage: result.subtitleLanguage
       }).catch(() => {});
     },
 
     onError: (error) => {
-      runningDownloads.delete(url);
+      runningDownloads.delete(streamUrl);
       chrome.runtime.sendMessage({
         action: 'downloadError',
-        url: url,
+        url: streamUrl,
         error: error.message,
         tooLarge: !!error.tooLarge // popup offers the bridge handoff
       }).catch(() => {});
     }
   });
 
-  runningDownloads.set(url, downloader);
+  runningDownloads.set(streamUrl, downloader);
   downloader.download(url, filename);
 }
