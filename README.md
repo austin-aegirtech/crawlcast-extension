@@ -246,6 +246,11 @@ Browser media request
 
 Crawlcast supports an optional Chrome native messaging host for final MP4 inspection and repair.
 
+For public Windows distribution, build the per-user companion installer in
+[`companion/windows`](./companion/windows). It packages the native host with
+FFmpeg/FFprobe and registers it for both Chrome and Edge, so customers do not
+need Python or a separate FFmpeg installation.
+
 ### Why it exists
 
 The in-browser HLS pipeline produces fragmented MP4 output. Some players can open those files directly, but conventional finalized MP4 files are generally better for:

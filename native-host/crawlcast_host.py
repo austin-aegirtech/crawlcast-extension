@@ -14,8 +14,18 @@ import unicodedata
 
 # Used to repair fragmented/non-faststart MP4s produced by the in-browser
 # pipeline. Optional: if absent, files are simply left as they are.
-FFMPEG_BIN = os.environ.get("CRAWLCAST_FFMPEG_BIN", "ffmpeg")
-FFPROBE_BIN = os.environ.get("CRAWLCAST_FFPROBE_BIN", "ffprobe")
+def bundled_tool(name):
+    """Prefer tools shipped beside the packaged companion executable."""
+    base_dir = os.path.dirname(
+        sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__)
+    )
+    executable = f"{name}.exe" if os.name == "nt" else name
+    candidate = os.path.join(base_dir, "bin", executable)
+    return candidate if os.path.isfile(candidate) else name
+
+
+FFMPEG_BIN = os.environ.get("CRAWLCAST_FFMPEG_BIN", bundled_tool("ffmpeg"))
+FFPROBE_BIN = os.environ.get("CRAWLCAST_FFPROBE_BIN", bundled_tool("ffprobe"))
 LOUDNESS_TARGET_I = -16.0
 LOUDNESS_TARGET_TP = -1.5
 LOUDNESS_TARGET_LRA = 11.0
