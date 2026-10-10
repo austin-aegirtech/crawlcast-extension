@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.4.0](https://github.com/austin-aegirtech/crawlcast-extension/compare/v0.3.0...v0.4.0) (2026-10-10)
+
+
+### Features
+
+* **audio:** normalize audio on download and add analyze and fix audio scripts ([#32](https://github.com/austin-aegirtech/crawlcast-extension/issues/32)) ([02f3f0e](https://github.com/austin-aegirtech/crawlcast-extension/commit/02f3f0ec17ddfcba379d9cc58438963bc15ff28e))
+* **backlight:** add backlight to elements active or in focus ([#29](https://github.com/austin-aegirtech/crawlcast-extension/issues/29)) ([ff29beb](https://github.com/austin-aegirtech/crawlcast-extension/commit/ff29beba9c24bcca0fa500dc5b2630246516f844))
+
+
+### Bug Fixes
+
+* **memory:** change memory for downloads to 3gb ([9248dd8](https://github.com/austin-aegirtech/crawlcast-extension/commit/9248dd8a1f6280592f0a620c2606618ffd780e54))
+
 ## [0.3.0](https://github.com/austin-aegirtech/crawlcast-extension/compare/v0.2.1...v0.3.0) (2026-09-20)
 
 
